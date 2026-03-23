@@ -1,0 +1,5 @@
+method,Recall@1,Hit@1,Recall@5,Hit@5,Recall@10,Hit@10,MRR,PageAccuracy
+visual_only,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
+ocr_bm25,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
+fixed_fusion,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
+rrf_fusion,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0

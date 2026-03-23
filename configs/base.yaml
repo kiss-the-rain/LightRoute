@@ -1,0 +1,33 @@
+includes:
+  - dataset.yaml
+  - retrieval.yaml
+  - fusion.yaml
+  - experiment.yaml
+
+project:
+  name: light_route
+
+seed: 42
+device: cpu
+num_workers: 2
+
+paths:
+  root_dir: .
+  raw_data_dir: data/raw
+  processed_dir: data/processed
+  page_image_dir: data/page_images
+  ocr_dir: data/ocr
+  index_dir: data/indexes
+  embedding_dir: data/embeddings
+  output_dir: outputs
+  log_dir: outputs/logs
+  checkpoint_dir: outputs/checkpoints
+  prediction_dir: outputs/predictions
+  metric_dir: outputs/metrics
+  figure_dir: outputs/figures
+  cache_dir: outputs/cache
+
+runtime:
+  create_dirs_on_startup: true
+  use_cache: true
+  overwrite_cache: false

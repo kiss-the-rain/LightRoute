@@ -1,0 +1,2 @@
+{"qid": "q_demo_001", "page_ids": ["doc_demo_page_002", "doc_demo_page_001", "doc_demo_page_003"], "scores": [1.779648953918184, 0.0, 0.0], "evidence_page_ids": ["doc_demo_page_002"]}
+{"qid": "q_demo_002", "page_ids": ["doc_demo_page_003", "doc_demo_page_001", "doc_demo_page_002"], "scores": [3.003931818968628, 0.0, 0.0], "evidence_page_ids": ["doc_demo_page_003"]}

@@ -1,0 +1,12 @@
+fusion:
+  type: fixed
+  supported_types:
+    - visual_only
+    - text_only
+    - fixed
+    - rrf
+  alpha: 0.5
+  rrf_k: 60
+  feature_dim: 16
+  hidden_dim: 64
+  dropout: 0.1

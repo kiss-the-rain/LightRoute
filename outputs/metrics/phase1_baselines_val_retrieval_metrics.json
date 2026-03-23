@@ -1,0 +1,42 @@
+{
+  "visual_only": {
+    "Recall@1": 1.0,
+    "Hit@1": 1.0,
+    "Recall@5": 1.0,
+    "Hit@5": 1.0,
+    "Recall@10": 1.0,
+    "Hit@10": 1.0,
+    "MRR": 1.0,
+    "PageAccuracy": 1.0
+  },
+  "ocr_bm25": {
+    "Recall@1": 1.0,
+    "Hit@1": 1.0,
+    "Recall@5": 1.0,
+    "Hit@5": 1.0,
+    "Recall@10": 1.0,
+    "Hit@10": 1.0,
+    "MRR": 1.0,
+    "PageAccuracy": 1.0
+  },
+  "fixed_fusion": {
+    "Recall@1": 1.0,
+    "Hit@1": 1.0,
+    "Recall@5": 1.0,
+    "Hit@5": 1.0,
+    "Recall@10": 1.0,
+    "Hit@10": 1.0,
+    "MRR": 1.0,
+    "PageAccuracy": 1.0
+  },
+  "rrf_fusion": {
+    "Recall@1": 1.0,
+    "Hit@1": 1.0,
+    "Recall@5": 1.0,
+    "Hit@5": 1.0,
+    "Recall@10": 1.0,
+    "Hit@10": 1.0,
+    "MRR": 1.0,
+    "PageAccuracy": 1.0
+  }
+}

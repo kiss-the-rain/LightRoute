@@ -1,0 +1,41 @@
+[
+  {
+    "page_id": "doc_demo_page_001",
+    "full_text": "Purchase order summary and vendor information",
+    "blocks": [
+      {
+        "text": "Purchase order summary and vendor information",
+        "bbox": [0, 0, 100, 20],
+        "score": 0.95
+      }
+    ],
+    "avg_confidence": 0.95,
+    "token_count": 6
+  },
+  {
+    "page_id": "doc_demo_page_002",
+    "full_text": "Invoice number INV 2024 billing address and issue date",
+    "blocks": [
+      {
+        "text": "Invoice number INV 2024 billing address and issue date",
+        "bbox": [0, 0, 100, 20],
+        "score": 0.96
+      }
+    ],
+    "avg_confidence": 0.96,
+    "token_count": 9
+  },
+  {
+    "page_id": "doc_demo_page_003",
+    "full_text": "Payment summary total amount 512 due balance",
+    "blocks": [
+      {
+        "text": "Payment summary total amount 512 due balance",
+        "bbox": [0, 0, 100, 20],
+        "score": 0.94
+      }
+    ],
+    "avg_confidence": 0.94,
+    "token_count": 7
+  }
+]

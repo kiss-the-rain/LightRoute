@@ -1,0 +1,21 @@
+retrieval:
+  topk_visual: 10
+  topk_text: 10
+  candidate_merge_mode: union
+  evaluation_topk: [1, 5, 10]
+  score_normalization_method: minmax
+  cache_predictions: true
+
+visual_retriever:
+  type: colpali_stub
+  embedding_dim: 128
+  use_surrogate_text: true
+  cache_embeddings: true
+  cache_path: data/embeddings/visual_index.pkl
+
+text_retriever:
+  type: bm25
+  cache_index: true
+  cache_path: data/indexes/text_bm25_index.pkl
+  k1: 1.5
+  b: 0.75

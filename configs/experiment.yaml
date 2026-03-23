@@ -1,0 +1,25 @@
+experiment:
+  name: phase1_baselines
+  mode: eval_retrieval
+  split: val
+  checkpoint_path: ""
+
+training:
+  batch_size: 16
+  epochs: 5
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: constant
+  early_stopping_patience: 3
+
+evaluation:
+  save_json: true
+  save_csv: true
+  save_predictions: true
+  metrics:
+    retrieval:
+      - recall
+      - hit
+      - mrr
+      - page_accuracy

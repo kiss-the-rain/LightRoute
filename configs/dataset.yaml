@@ -1,0 +1,18 @@
+dataset:
+  name: docvqa
+  raw_annotation_dir: data/raw/annotations
+  raw_pdf_dir: data/raw/pdfs
+  processed_dir: data/processed
+  page_image_dir: data/page_images
+  ocr_dir: data/ocr
+  split_files:
+    train: data/raw/annotations/train.json
+    val: data/raw/annotations/val.json
+    test: data/raw/annotations/test.json
+  processed_files:
+    train: data/processed/train.jsonl
+    val: data/processed/val.jsonl
+    test: data/processed/test.jsonl
+  image_ext: .png
+  ocr_ext: .json
+  default_answer: ""
