@@ -1,0 +1,46 @@
+[
+  {
+    "question": "What is the invoice number?",
+    "gt_evidence": [
+      "doc_demo_page_002"
+    ],
+    "visual_top_k": [
+      "doc_demo_page_002",
+      "doc_demo_page_001",
+      "doc_demo_page_003"
+    ],
+    "ocr_top_k": [
+      "doc_demo_page_002",
+      "doc_demo_page_001",
+      "doc_demo_page_003"
+    ],
+    "fusion_top_k": [
+      "doc_demo_page_002",
+      "doc_demo_page_001",
+      "doc_demo_page_003"
+    ],
+    "final_answer": "Invoice number INV 2024 billing address and issue date"
+  },
+  {
+    "question": "Which page mentions total amount 512?",
+    "gt_evidence": [
+      "doc_demo_page_003"
+    ],
+    "visual_top_k": [
+      "doc_demo_page_003",
+      "doc_demo_page_001",
+      "doc_demo_page_002"
+    ],
+    "ocr_top_k": [
+      "doc_demo_page_003",
+      "doc_demo_page_001",
+      "doc_demo_page_002"
+    ],
+    "fusion_top_k": [
+      "doc_demo_page_003",
+      "doc_demo_page_001",
+      "doc_demo_page_002"
+    ],
+    "final_answer": "Payment summary total amount 512 due balance"
+  }
+]
