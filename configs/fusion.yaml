@@ -1,5 +1,6 @@
 fusion:
   type: fixed
+  current_best_variant: adaptive_fusion_ablate_mlp_ocrq
   supported_types:
     - visual_only
     - text_only

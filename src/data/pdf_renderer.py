@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from utils.io_utils import ensure_dir
+from src.utils.io_utils import ensure_dir
 
 try:
     import fitz

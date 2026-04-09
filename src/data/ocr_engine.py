@@ -1,13 +1,13 @@
-"""Unified OCR interface with dummy and optional Tesseract/Paddle backends."""
+"""Unified OCR interface with extensible backend dispatch."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, Protocol
 
-from utils.text_utils import clean_ocr_text, tokenize_text
+from src.utils.text_utils import clean_ocr_text, tokenize_text
 
 try:
     import pytesseract
@@ -15,6 +15,13 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None
     Image = None
+
+
+class OCRBackend(Protocol):
+    """Protocol for pluggable OCR backends."""
+
+    def run_ocr_on_page(self, image_path: str | Path) -> dict[str, Any]:
+        """Run OCR on a single page."""
 
 
 @dataclass
@@ -89,3 +96,13 @@ class OCREngine:
             "avg_confidence": mean(confidences) if confidences else 0.0,
             "token_count": len(tokenize_text(full_text)),
         }
+
+
+def run_ocr_on_page(image_path: str | Path, backend: str = "dummy") -> dict[str, Any]:
+    """Module-level OCR helper for single-page use."""
+    return OCREngine(backend=backend).run_ocr_on_page(image_path)
+
+
+def run_ocr_on_document(image_paths: list[str] | list[Path], backend: str = "dummy") -> list[dict[str, Any]]:
+    """Module-level OCR helper for document-level use."""
+    return OCREngine(backend=backend).run_ocr_on_document(image_paths)

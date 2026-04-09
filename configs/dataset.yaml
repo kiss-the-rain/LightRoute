@@ -1,18 +1,29 @@
 dataset:
-  name: docvqa
-  raw_annotation_dir: data/raw/annotations
-  raw_pdf_dir: data/raw/pdfs
+  name: mpdocvqa
+  raw_data_dir: data/raw/mpdocvqa
+  raw_image_dir: data/raw/mpdocvqa/images
+  raw_ocr_dir: data/raw/mpdocvqa/ocr
+  raw_qas_dir: data/raw/mpdocvqa/qas
+  raw_imdb_dir: data/raw/mpdocvqa/mpdocvqa_imdbs
   processed_dir: data/processed
-  page_image_dir: data/page_images
+  page_image_dir: data/raw/mpdocvqa/images
   ocr_dir: data/ocr
   split_files:
-    train: data/raw/annotations/train.json
-    val: data/raw/annotations/val.json
-    test: data/raw/annotations/test.json
+    train: data/raw/mpdocvqa/mpdocvqa_imdbs/imdb_train.npy
+    val: data/raw/mpdocvqa/mpdocvqa_imdbs/imdb_val.npy
+    test: data/raw/mpdocvqa/mpdocvqa_imdbs/imdb_test.npy
+  qa_files:
+    train: data/raw/mpdocvqa/qas/train.json
+    val: data/raw/mpdocvqa/qas/val.json
+    test: data/raw/mpdocvqa/qas/test.json
   processed_files:
-    train: data/processed/train.jsonl
-    val: data/processed/val.jsonl
-    test: data/processed/test.jsonl
-  image_ext: .png
+    train: data/processed/mpdocvqa/train.jsonl
+    val: data/processed/mpdocvqa/val.jsonl
+    test: data/processed/mpdocvqa/test.jsonl
+  train_path: data/processed/mpdocvqa/train.jsonl
+  val_path: data/processed/mpdocvqa/val.jsonl
+  test_path: data/processed/mpdocvqa/test.jsonl
+  image_ext: .jpg
   ocr_ext: .json
+  page_id_template: "{doc_id}_p{page_index}"
   default_answer: ""

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from data.doc_dataset import DocVQADataset
-from data.sample_builder import SampleBuilder
+from src.data.doc_dataset import DocVQADataset
+from src.data.sample_builder import SampleBuilder
 
 
 class DatasetManager:

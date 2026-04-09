@@ -3,6 +3,9 @@ numpy>=1.26
 tqdm>=4.66
 rank-bm25>=0.2.2
 torch>=2.2
+transformers>4.45.0
+colpali-engine>=0.3.7
+peft>=0.11
 Pillow>=10.0
 PyMuPDF>=1.24
 pytesseract>=0.3.10

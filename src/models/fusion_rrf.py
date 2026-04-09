@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from utils.rank_utils import reciprocal_rank, sort_pages_by_score
+from src.utils.rank_utils import reciprocal_rank, sort_pages_by_score
 
 
 class RRFFusion:

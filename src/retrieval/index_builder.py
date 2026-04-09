@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from utils.io_utils import load_json
+from src.utils.io_utils import load_json, load_pickle, save_pickle
 
 
 def collect_document_pages(cfg: Any, processed_samples: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -41,3 +41,13 @@ def build_visual_index(visual_retriever: Any, documents: dict[str, list[dict[str
 def build_text_index(text_retriever: Any, documents: dict[str, list[dict[str, Any]]]) -> None:
     """Build the OCR text retrieval index."""
     text_retriever.build_index(documents)
+
+
+def save_index(index: Any, path: str | Path) -> None:
+    """Persist a retrieval index to disk."""
+    save_pickle(index, path)
+
+
+def load_index(path: str | Path) -> Any:
+    """Load a persisted retrieval index from disk."""
+    return load_pickle(path)

@@ -1,6 +1,6 @@
 """Backward-compatible fusion trainer wrapper."""
 
-from training.train_fusion import train_fusion
+from src.training.train_fusion import train_fusion
 
 
 class FusionTrainer:

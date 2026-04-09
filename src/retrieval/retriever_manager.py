@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from retrieval.candidate_merger import merge_candidates
+from src.retrieval.candidate_merger import merge_candidates
 
 
 class RetrieverManager:
@@ -21,7 +21,7 @@ class RetrieverManager:
         question = sample["question"]
         doc_id = sample["doc_id"]
         visual_results = self.visual_retriever.retrieve(question, doc_id, int(self.cfg.retrieval.topk_visual))
-        text_results = self.text_retriever.retrieve(question, doc_id, int(self.cfg.retrieval.topk_text))
+        text_results = self.text_retriever.retrieve(question, topk=int(self.cfg.retrieval.topk_text), doc_id=doc_id)
 
         page_metadata = {}
         for ocr_entry in sample.get("ocr_results", []):
@@ -44,3 +44,9 @@ class RetrieverManager:
             "text": text_results,
             "candidates": candidates,
         }
+
+    def retrieve_ocr_only(self, sample: dict[str, Any], topk: int) -> dict[str, list]:
+        """Run OCR-only retrieval for a single sample."""
+        question = sample["question"]
+        doc_id = sample["doc_id"]
+        return self.text_retriever.retrieve(question, topk=topk, doc_id=doc_id)

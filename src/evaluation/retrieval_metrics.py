@@ -5,42 +5,41 @@ from __future__ import annotations
 from typing import Iterable
 
 
-def recall_at_k(predicted_page_ids: list[str], evidence_page_ids: set[str], k: int) -> float:
+def recall_at_k(pred_page_ids: list[int], evidence_pages: set[int], k: int) -> float:
     """Compute Recall@K for page retrieval."""
-    if not evidence_page_ids:
+    if not evidence_pages:
         return 0.0
-    hits = len(set(predicted_page_ids[:k]) & evidence_page_ids)
-    return hits / float(len(evidence_page_ids))
+    return float(bool(set(pred_page_ids[:k]) & evidence_pages))
 
 
-def hit_at_k(predicted_page_ids: list[str], evidence_page_ids: set[str], k: int) -> float:
+def hit_at_k(pred_page_ids: list[int], evidence_pages: set[int], k: int) -> float:
     """Compute Hit@K for page retrieval."""
-    return float(bool(set(predicted_page_ids[:k]) & evidence_page_ids))
+    return float(bool(set(pred_page_ids[:k]) & evidence_pages))
 
 
-def mrr(predicted_page_ids: list[str], evidence_page_ids: set[str]) -> float:
-    """Compute reciprocal rank of the first relevant page."""
-    for rank, page_id in enumerate(predicted_page_ids, start=1):
-        if page_id in evidence_page_ids:
+def mrr(pred_page_ids: list[int], evidence_pages: set[int]) -> float:
+    """Compute reciprocal rank of the first evidence-page hit."""
+    for rank, page_id in enumerate(pred_page_ids, start=1):
+        if page_id in evidence_pages:
             return 1.0 / float(rank)
     return 0.0
 
 
-def page_level_accuracy(predicted_page_ids: list[str], evidence_page_ids: set[str]) -> float:
-    """Compute whether the top-1 page is relevant."""
-    return float(bool(predicted_page_ids) and predicted_page_ids[0] in evidence_page_ids)
+def page_level_accuracy(pred_page_ids: list[int], evidence_pages: set[int]) -> float:
+    """Compute whether the top-1 predicted page is relevant."""
+    return float(bool(pred_page_ids) and pred_page_ids[0] in evidence_pages)
 
 
-def compute_retrieval_metrics(predictions: Iterable[dict], ks: list[int]) -> dict[str, float]:
-    """Aggregate retrieval metrics over all samples."""
-    predictions = list(predictions)
+def evaluate_retrieval(predictions: list[dict], k_values: list[int]) -> dict[str, float]:
+    """Aggregate retrieval metrics from OCR-only or other page-level predictions."""
     if not predictions:
         return {}
 
     metrics: dict[str, float] = {}
-    for k in ks:
-        metrics[f"Recall@{k}"] = sum(recall_at_k(item["page_ids"], set(item["evidence_page_ids"]), k) for item in predictions) / len(predictions)
-        metrics[f"Hit@{k}"] = sum(hit_at_k(item["page_ids"], set(item["evidence_page_ids"]), k) for item in predictions) / len(predictions)
-    metrics["MRR"] = sum(mrr(item["page_ids"], set(item["evidence_page_ids"])) for item in predictions) / len(predictions)
-    metrics["PageAccuracy"] = sum(page_level_accuracy(item["page_ids"], set(item["evidence_page_ids"])) for item in predictions) / len(predictions)
+    for k in k_values:
+        metrics[f"Recall@{k}"] = sum(recall_at_k(item["pred_page_ids"], set(item["evidence_pages"]), k) for item in predictions) / len(predictions)
+        metrics[f"Hit@{k}"] = sum(hit_at_k(item["pred_page_ids"], set(item["evidence_pages"]), k) for item in predictions) / len(predictions)
+    metrics["MRR"] = sum(mrr(item["pred_page_ids"], set(item["evidence_pages"])) for item in predictions) / len(predictions)
+    metrics["PageAcc"] = sum(page_level_accuracy(item["pred_page_ids"], set(item["evidence_pages"])) for item in predictions) / len(predictions)
+    metrics["num_samples"] = len(predictions)
     return metrics

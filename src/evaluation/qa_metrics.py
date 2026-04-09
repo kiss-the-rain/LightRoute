@@ -1,4 +1,4 @@
-"""QA metrics reserved for later end-to-end DocVQA evaluation."""
+"""QA metrics for end-to-end DocVQA evaluation."""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ import re
 
 
 def exact_match(prediction: str, answer: str) -> float:
+    """Compute exact match after normalization."""
     return float(_normalize(prediction) == _normalize(answer))
 
 
 def f1_score(prediction: str, answer: str) -> float:
+    """Compute token-level F1 after normalization."""
     pred_tokens = _normalize(prediction).split()
     gold_tokens = _normalize(answer).split()
     if not pred_tokens and not gold_tokens:
@@ -30,6 +32,7 @@ def f1_score(prediction: str, answer: str) -> float:
 
 
 def anls(prediction: str, answer: str) -> float:
+    """Return a placeholder ANLS score, falling back to exact match for now."""
     return exact_match(prediction, answer)
 
 

@@ -9,7 +9,7 @@ project:
 
 seed: 42
 device: cpu
-num_workers: 2
+num_workers: 16
 
 paths:
   root_dir: .

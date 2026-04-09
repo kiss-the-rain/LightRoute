@@ -1,4 +1,6 @@
 retrieval:
+  topk: 10
+  k_values: [1, 5, 10]
   topk_visual: 10
   topk_text: 10
   candidate_merge_mode: union
@@ -13,9 +15,67 @@ visual_retriever:
   cache_embeddings: true
   cache_path: data/embeddings/visual_index.pkl
 
+visual:
+  model_name: src/models/vidore_colpali_v1.2_hf
+  device: cuda:0
+  topk: 10
+  local_files_only: true
+
+visual_colqwen_retrieval:
+  model_name: /home/cuizhibin/projects/Models/colqwen2.5-v0.2
+  base_model_name: /home/cuizhibin/projects/Models/colqwen2.5-base
+  local_files_only: true
+  device: cuda:0
+  batch_size: 4
+  max_pages_per_doc: 256
+
 text_retriever:
   type: bm25
   cache_index: true
   cache_path: data/indexes/text_bm25_index.pkl
   k1: 1.5
   b: 0.75
+
+ocr_retrieval:
+  bge_model_name: /home/cuizhibin/projects/Models/bge-m3
+  reranker_model_name: /home/cuizhibin/projects/Models/bge-reranker-v2-m3
+  topk: 10
+  coarse_topn: 30
+  batch_size: 8
+  rerank_batch_size: 8
+  max_length: 512
+  rerank_max_length: 512
+  device: cuda:0
+  local_files_only: true
+
+ocr_chunk_retrieval:
+  chunk_size: 128
+  chunk_stride: 96
+  page_text_variant: clean_page_text
+  query_variant: instruction_query
+  aggregate_strategy: max
+  coarse_topn: 30
+  hybrid_bm25_topn: 20
+  debug_chunk_stats: true
+
+ocr_nv_retrieval:
+  model_name: /home/cuizhibin/projects/Models/NV-Embed-v2
+  local_files_only: true
+  device: cuda:0
+  query_instruction: "Instruct: Given a question, retrieve passages that answer the question\nQuery: "
+  topk: 10
+  coarse_topn: 30
+  batch_size: 2
+  max_length: 512
+
+ocr_jina_retrieval:
+  model_name: /home/cuizhibin/projects/Models/jina-embeddings-v3
+  dependency_model_name: /home/cuizhibin/projects/Models/xlm-roberta-flash-implementation
+  local_files_only: true
+  device: cuda:0
+  topk: 10
+  coarse_topn: 30
+  query_task: retrieval.query
+  passage_task: retrieval.passage
+  batch_size: 8
+  max_length: 1024

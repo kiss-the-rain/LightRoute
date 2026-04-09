@@ -1,24 +1,58 @@
-"""Top-level pipeline orchestration with cache-aware phase execution."""
+"""Top-level pipeline orchestration for retrieval, training, and DocVQA inference."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from data.dataset import DatasetManager
-from data.doc_dataset import DocVQADataset
-from data.ocr_engine import OCREngine
-from data.pdf_renderer import render_pdf_to_images
-from evaluation.evaluator import Evaluator
-from inference.infer_docvqa import infer_docvqa_sample
-from retrieval.colpali_retriever import ColPaliRetriever
-from retrieval.bm25_retriever import BM25Retriever
-from retrieval.index_builder import build_text_index, build_visual_index, collect_document_pages
-from retrieval.retriever_manager import RetrieverManager
-from training.train_fusion import train_fusion
-from utils.io_utils import ensure_dir, save_json, save_jsonl
-from utils.logger import setup_logger
-from utils.seed_utils import set_seed
+from src.data.dataset import DatasetManager
+from src.data.doc_dataset import DocVQADataset
+from src.data.ocr_engine import OCREngine
+from src.data.pdf_renderer import render_pdf_to_images
+from src.evaluation.case_study import export_case_study
+from src.evaluation.evaluator import Evaluator
+from src.evaluation.qa_metrics import anls, exact_match, f1_score
+from src.inference.infer_docvqa import infer_docvqa_sample
+from src.retrieval.colpali_retriever import ColPaliRetriever
+from src.retrieval.bm25_retriever import BM25Retriever
+from src.retrieval.index_builder import build_text_index, build_visual_index, collect_document_pages
+from src.retrieval.retriever_manager import RetrieverManager
+from src.training.train_fusion import (
+    train_fusion,
+    train_fusion_ablation,
+    train_fusion_mlp_ocrq_bge,
+    train_fusion_mlp_ocrq_chunk,
+    train_fusion_visual_colqwen_ocr_chunk,
+    train_fusion_mlp_ocrq_chunkplus,
+    train_fusion_mlp_ocrq_hybrid,
+    train_fusion_mlp_ocrq_nvchunk,
+    train_fusion_v2,
+)
+from src.utils.io_utils import ensure_dir, save_json, save_jsonl
+from src.utils.logger import get_logger
+from src.utils.seed_utils import set_seed
+from src.inference.infer_retrieval import (
+    run_adaptive_fusion_on_dataset,
+    run_adaptive_fusion_ablation_on_dataset,
+    run_adaptive_fusion_mlp_ocrq_bge_on_dataset,
+    run_adaptive_fusion_mlp_ocrq_chunk_on_dataset,
+    run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset,
+    run_adaptive_fusion_mlp_ocrq_chunkplus_on_dataset,
+    run_adaptive_fusion_mlp_ocrq_hybrid_on_dataset,
+    run_adaptive_fusion_mlp_ocrq_nvchunk_on_dataset,
+    run_adaptive_fusion_v2_on_dataset,
+    run_bm25_retrieval_on_dataset,
+    run_ocr_bge_debug_on_dataset,
+    run_ocr_bge_chunk_retrieval_on_dataset,
+    run_ocr_bge_retrieval_on_dataset,
+    run_ocr_hybrid_retrieval_on_dataset,
+    run_ocr_jina_chunk_retrieval_on_dataset,
+    run_ocr_nv_chunk_retrieval_on_dataset,
+    run_fixed_fusion_on_dataset,
+    run_rrf_fusion_on_dataset,
+    run_visual_colqwen_retrieval_on_dataset,
+    run_visual_retrieval_on_dataset,
+)
 
 
 def prepare_data_pipeline(cfg: Any) -> None:
@@ -31,7 +65,17 @@ def prepare_data_pipeline(cfg: Any) -> None:
 
     for split in cfg.dataset.processed_files.keys():
         processed_path = Path(cfg.dataset.processed_files[split])
-        if _should_skip(cfg, processed_path):
+        if cfg.dataset.name == "mpdocvqa":
+            report_path = Path(cfg.paths.log_dir) / f"mpdocvqa_build_report_{split}.json"
+            if _should_skip_split(cfg, processed_path, report_path):
+                logger.info(
+                    "Skipping split %s because processed file and build report already exist: %s, %s",
+                    split,
+                    processed_path,
+                    report_path,
+                )
+                continue
+        elif _should_skip(cfg, processed_path):
             logger.info("Skipping split %s because processed file exists: %s", split, processed_path)
             continue
 
@@ -84,28 +128,1092 @@ def eval_retrieval_pipeline(cfg: Any) -> None:
     logger.info("Retrieval evaluation completed: %s", metrics)
 
 
+def eval_bm25_retrieval_pipeline(cfg: Any) -> None:
+    """Run OCR-only BM25 retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_bm25_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_bm25_retrieval_on_dataset(
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25 val predictions to %s", prediction_path)
+    logger.info("Saved BM25 val metrics to %s", metrics_path)
+    logger.info("BM25 val metrics: %s", metrics)
+
+
+def infer_bm25_test_pipeline(cfg: Any) -> None:
+    """Run OCR-only BM25 retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_bm25_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_bm25_retrieval_on_dataset(
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved BM25 test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("BM25 test metrics: %s", metrics)
+
+
+def eval_ocr_bge_retrieval_pipeline(cfg: Any) -> None:
+    """Run OCR BGE dense retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_bge_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=False,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR BGE val predictions to %s", prediction_path)
+    logger.info("Saved OCR BGE val metrics to %s", metrics_path)
+
+
+def infer_ocr_bge_test_pipeline(cfg: Any) -> None:
+    """Run OCR BGE dense retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_bge_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_bge_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=False,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved OCR BGE test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR BGE test metrics: %s", metrics)
+
+
+def eval_ocr_bge_rerank_pipeline(cfg: Any) -> None:
+    """Run OCR BGE retrieval + rerank on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_rerank_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_bge_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=True,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_rerank_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_rerank_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR BGE rerank val predictions to %s", prediction_path)
+    logger.info("Saved OCR BGE rerank val metrics to %s", metrics_path)
+
+
+def eval_ocr_bge_debug_pipeline(cfg: Any) -> None:
+    """Run OCR-BGE debug experiments on the validation split and save analysis outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_debug_val")
+    _ensure_runtime_dirs(cfg)
+    summary, run_records, failure_cases = run_ocr_bge_debug_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        use_reranker=False,
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_debug_val_metrics.json"
+    runs_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_debug_runs.jsonl"
+    failures_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_failure_cases.jsonl"
+    ensure_dir(runs_path.parent)
+    save_json(summary, metrics_path)
+    save_jsonl(run_records, runs_path)
+    save_jsonl(failure_cases, failures_path)
+    logger.info("Saved OCR BGE debug summary to %s", metrics_path)
+    logger.info("Saved OCR BGE debug runs to %s", runs_path)
+    logger.info("Saved OCR BGE debug failure cases to %s", failures_path)
+
+
+def eval_ocr_bge_rerank_debug_pipeline(cfg: Any) -> None:
+    """Run OCR-BGE rerank debug experiments on the validation split and save analysis outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_rerank_debug_val")
+    _ensure_runtime_dirs(cfg)
+    summary, run_records, failure_cases = run_ocr_bge_debug_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        use_reranker=True,
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_rerank_debug_val_metrics.json"
+    runs_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_rerank_debug_runs.jsonl"
+    failures_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_rerank_failure_cases.jsonl"
+    ensure_dir(runs_path.parent)
+    save_json(summary, metrics_path)
+    save_jsonl(run_records, runs_path)
+    save_jsonl(failure_cases, failures_path)
+    logger.info("Saved OCR BGE rerank debug summary to %s", metrics_path)
+    logger.info("Saved OCR BGE rerank debug runs to %s", runs_path)
+    logger.info("Saved OCR BGE rerank debug failure cases to %s", failures_path)
+
+
+def infer_ocr_bge_rerank_test_pipeline(cfg: Any) -> None:
+    """Run OCR BGE retrieval + rerank on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_bge_rerank_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_bge_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=True,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_rerank_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved OCR BGE rerank test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR BGE rerank test metrics: %s", metrics)
+
+
+def eval_ocr_bge_chunk_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR BGE retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_bge_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=False,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_chunk_val_metrics.json"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_chunk_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR BGE chunk val predictions to %s", prediction_path)
+    logger.info("Saved OCR BGE chunk val metrics to %s", metrics_path)
+
+
+def infer_ocr_bge_chunk_test_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR BGE retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_bge_chunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_bge_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=False,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_chunk_test_predictions.jsonl"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_chunk_test_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR BGE chunk test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR BGE chunk test metrics: %s", metrics)
+
+
+def eval_ocr_nv_chunk_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR retrieval with NV-Embed-v2 on the validation split."""
+    logger = _build_logger(cfg, "eval_ocr_nv_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_nv_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_nv_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_nv_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_nv_chunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR NV chunk val predictions to %s", prediction_path)
+    logger.info("Saved OCR NV chunk val metrics to %s", metrics_path)
+
+
+def eval_ocr_jina_chunk_pipeline(cfg: Any) -> None:
+    """Run offline jina-embeddings-v3 chunk OCR retrieval on validation and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_jina_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_jina_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_jina_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_jina_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_jina_chunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR jina chunk val predictions to %s", prediction_path)
+    logger.info("Saved OCR jina chunk val metrics to %s", metrics_path)
+
+
+def infer_ocr_nv_chunk_test_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR retrieval with NV-Embed-v2 on the test split."""
+    logger = _build_logger(cfg, "infer_ocr_nv_chunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_nv_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_nv_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_nv_chunk_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved OCR NV chunk test predictions to %s", prediction_path)
+
+
+def infer_ocr_jina_chunk_test_pipeline(cfg: Any) -> None:
+    """Run offline jina-embeddings-v3 chunk OCR retrieval on test and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_jina_chunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_jina_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_jina_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_jina_chunk_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved OCR jina chunk test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR NV chunk test metrics: %s", metrics)
+
+
+def eval_ocr_bge_chunk_rerank_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR BGE retrieval + rerank on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_bge_chunk_rerank_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_bge_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=True,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_chunk_rerank_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_bge_chunk_rerank_val_metrics.json"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_chunk_rerank_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR BGE chunk rerank val predictions to %s", prediction_path)
+    logger.info("Saved OCR BGE chunk rerank val metrics to %s", metrics_path)
+
+
+def infer_ocr_bge_chunk_rerank_test_pipeline(cfg: Any) -> None:
+    """Run chunk-level OCR BGE retrieval + rerank on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_bge_chunk_rerank_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_bge_chunk_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        use_reranker=True,
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_bge_chunk_rerank_test_predictions.jsonl"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_bge_chunk_rerank_test_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR BGE chunk rerank test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR BGE chunk rerank test metrics: %s", metrics)
+
+
+def eval_ocr_hybrid_pipeline(cfg: Any) -> None:
+    """Run hybrid OCR retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_ocr_hybrid_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_hybrid_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_hybrid_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_hybrid_val_metrics.json"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_hybrid_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR hybrid val predictions to %s", prediction_path)
+    logger.info("Saved OCR hybrid val metrics to %s", metrics_path)
+
+
+def infer_ocr_hybrid_test_pipeline(cfg: Any) -> None:
+    """Run hybrid OCR retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_ocr_hybrid_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics, failure_cases = run_ocr_hybrid_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.ocr_retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_hybrid_test_predictions.jsonl"
+    failure_path = Path(cfg.paths.output_dir) / "debug" / "ocr_hybrid_test_failure_cases.jsonl"
+    save_jsonl(predictions, prediction_path)
+    save_jsonl(failure_cases, failure_path)
+    logger.info("Saved OCR hybrid test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("OCR hybrid test metrics: %s", metrics)
+
+
+def eval_visual_retrieval_pipeline(cfg: Any) -> None:
+    """Run visual-only retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_visual_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual val predictions to %s", prediction_path)
+    logger.info("Saved visual val metrics to %s", metrics_path)
+    logger.info("Visual val metrics: %s", metrics)
+
+
+def eval_visual_colqwen_retrieval_pipeline(cfg: Any) -> None:
+    """Run ColQwen visual-only retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_visual_colqwen_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_colqwen_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_colqwen_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_colqwen_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual ColQwen val predictions to %s", prediction_path)
+    logger.info("Saved visual ColQwen val metrics to %s", metrics_path)
+    logger.info("Visual ColQwen val metrics: %s", metrics)
+
+
+def infer_visual_test_pipeline(cfg: Any) -> None:
+    """Run visual-only retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_visual_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved visual test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("Visual test metrics: %s", metrics)
+
+
+def infer_visual_colqwen_test_pipeline(cfg: Any) -> None:
+    """Run ColQwen visual-only retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_visual_colqwen_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_colqwen_retrieval_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_colqwen_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved visual ColQwen test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("Visual ColQwen test metrics: %s", metrics)
+
+
+def eval_fixed_fusion_pipeline(cfg: Any) -> None:
+    """Run fixed-fusion retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_fixed_fusion_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_fixed_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        alpha=float(cfg.fusion.alpha),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "fixed_fusion_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "fixed_fusion_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved fixed fusion val predictions to %s", prediction_path)
+    logger.info("Saved fixed fusion val metrics to %s", metrics_path)
+    logger.info("Fixed fusion val metrics: %s", metrics)
+
+
+def infer_fixed_fusion_test_pipeline(cfg: Any) -> None:
+    """Run fixed-fusion retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_fixed_fusion_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_fixed_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        alpha=float(cfg.fusion.alpha),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "fixed_fusion_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved fixed fusion test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("Fixed fusion test metrics: %s", metrics)
+
+
+def eval_rrf_pipeline(cfg: Any) -> None:
+    """Run RRF retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_rrf_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_rrf_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        rrf_k=int(cfg.fusion.rrf_k),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "rrf_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "rrf_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved RRF val predictions to %s", prediction_path)
+    logger.info("Saved RRF val metrics to %s", metrics_path)
+    logger.info("RRF val metrics: %s", metrics)
+
+
+def infer_rrf_test_pipeline(cfg: Any) -> None:
+    """Run RRF retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_rrf_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_rrf_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        rrf_k=int(cfg.fusion.rrf_k),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "rrf_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved RRF test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("RRF test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_pipeline(cfg: Any) -> None:
+    """Train the adaptive fusion reranker and save checkpoints/metrics."""
+    logger = _build_logger(cfg, "train_adaptive_fusion")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion(cfg)
+    logger.info("Adaptive fusion training completed: %s", metrics)
+
+
+def eval_adaptive_fusion_pipeline(cfg: Any) -> None:
+    """Run adaptive fusion retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive fusion val predictions to %s", prediction_path)
+    logger.info("Saved adaptive fusion val metrics to %s", metrics_path)
+    logger.info("Adaptive fusion val metrics: %s", metrics)
+
+
+def infer_adaptive_fusion_test_pipeline(cfg: Any) -> None:
+    """Run adaptive fusion retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive fusion test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("Adaptive fusion test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_v2_pipeline(cfg: Any) -> None:
+    """Train the enhanced adaptive fusion reranker and save checkpoints/metrics."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_v2")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_v2(cfg)
+    logger.info("Adaptive fusion v2 training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_v2_pipeline(cfg: Any) -> None:
+    """Run enhanced adaptive fusion retrieval on the validation split and save outputs."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_v2_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_v2_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_v2_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_v2_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive fusion v2 val predictions to %s", prediction_path)
+    logger.info("Saved adaptive fusion v2 val metrics to %s", metrics_path)
+    logger.info("Adaptive fusion v2 val metrics: %s", metrics)
+
+
+def infer_adaptive_fusion_v2_test_pipeline(cfg: Any) -> None:
+    """Run enhanced adaptive fusion retrieval on the test split and save predictions."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_v2_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_v2_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_v2_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive fusion v2 test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("Adaptive fusion v2 test metrics: %s", metrics)
+
+
+def _train_adaptive_ablation_pipeline(cfg: Any, variant: str) -> None:
+    """Train one rollback-style adaptive-fusion ablation variant."""
+    logger = _build_logger(cfg, f"train_adaptive_fusion_{variant}")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_ablation(cfg, variant=variant)
+    logger.info("%s training completed. checkpoint=%s", variant, metrics.get("checkpoint_path", ""))
+
+
+def _resolve_best_adaptive_variant(cfg: Any) -> str:
+    """Resolve the configured current-best adaptive fusion variant into the internal ablation slug."""
+    variant_name = str(cfg.fusion.current_best_variant)
+    return variant_name.removeprefix("adaptive_fusion_")
+
+
+def _eval_adaptive_ablation_pipeline(cfg: Any, variant: str) -> None:
+    """Evaluate one rollback-style adaptive-fusion ablation variant on validation split."""
+    logger = _build_logger(cfg, f"eval_adaptive_fusion_{variant}_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_ablation_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        variant=variant,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / f"adaptive_fusion_{variant}_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / f"adaptive_fusion_{variant}_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved %s val predictions to %s", variant, prediction_path)
+    logger.info("Saved %s val metrics to %s", variant, metrics_path)
+
+
+def _infer_adaptive_ablation_test_pipeline(cfg: Any, variant: str) -> None:
+    """Run one rollback-style adaptive-fusion ablation variant on test split."""
+    logger = _build_logger(cfg, f"infer_adaptive_fusion_{variant}_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_ablation_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        variant=variant,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / f"adaptive_fusion_{variant}_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved %s test predictions to %s", variant, prediction_path)
+    if metrics:
+        logger.info("%s test metrics: %s", variant, metrics)
+
+
+def train_adaptive_fusion_ablate_q_pipeline(cfg: Any) -> None:
+    """Train the question-feature-only ablation variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_q")
+
+
+def eval_adaptive_fusion_ablate_q_pipeline(cfg: Any) -> None:
+    """Evaluate the question-feature-only ablation variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_q")
+
+
+def infer_adaptive_fusion_ablate_q_test_pipeline(cfg: Any) -> None:
+    """Run the question-feature-only ablation variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_q")
+
+
+def train_adaptive_fusion_ablate_ocrq_pipeline(cfg: Any) -> None:
+    """Train the OCR-quality-only ablation variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_ocrq")
+
+
+def eval_adaptive_fusion_ablate_ocrq_pipeline(cfg: Any) -> None:
+    """Evaluate the OCR-quality-only ablation variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_ocrq")
+
+
+def infer_adaptive_fusion_ablate_ocrq_test_pipeline(cfg: Any) -> None:
+    """Run the OCR-quality-only ablation variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_ocrq")
+
+
+def train_adaptive_fusion_ablate_lex_pipeline(cfg: Any) -> None:
+    """Train the lexical-match-only ablation variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_lex")
+
+
+def eval_adaptive_fusion_ablate_lex_pipeline(cfg: Any) -> None:
+    """Evaluate the lexical-match-only ablation variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_lex")
+
+
+def infer_adaptive_fusion_ablate_lex_test_pipeline(cfg: Any) -> None:
+    """Run the lexical-match-only ablation variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_lex")
+
+
+def train_adaptive_fusion_ablate_mlp_pipeline(cfg: Any) -> None:
+    """Train the MLP-only ablation variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_mlp")
+
+
+def eval_adaptive_fusion_ablate_mlp_pipeline(cfg: Any) -> None:
+    """Evaluate the MLP-only ablation variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_mlp")
+
+
+def infer_adaptive_fusion_ablate_mlp_test_pipeline(cfg: Any) -> None:
+    """Run the MLP-only ablation variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_mlp")
+
+
+def train_adaptive_fusion_ablate_mlp_q_pipeline(cfg: Any) -> None:
+    """Train the MLP + question-aware combination variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_q")
+
+
+def eval_adaptive_fusion_ablate_mlp_q_pipeline(cfg: Any) -> None:
+    """Evaluate the MLP + question-aware combination variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_q")
+
+
+def infer_adaptive_fusion_ablate_mlp_q_test_pipeline(cfg: Any) -> None:
+    """Run the MLP + question-aware combination variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_mlp_q")
+
+
+def train_adaptive_fusion_ablate_mlp_ocrq_pipeline(cfg: Any) -> None:
+    """Train the MLP + OCR-quality combination variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_ocrq")
+
+
+def eval_adaptive_fusion_ablate_mlp_ocrq_pipeline(cfg: Any) -> None:
+    """Evaluate the MLP + OCR-quality combination variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_ocrq")
+
+
+def infer_adaptive_fusion_ablate_mlp_ocrq_test_pipeline(cfg: Any) -> None:
+    """Run the MLP + OCR-quality combination variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_mlp_ocrq")
+
+
+def train_adaptive_fusion_ablate_mlp_lex_pipeline(cfg: Any) -> None:
+    """Train the MLP + lexical-overlap combination variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_lex")
+
+
+def eval_adaptive_fusion_ablate_mlp_lex_pipeline(cfg: Any) -> None:
+    """Evaluate the MLP + lexical-overlap combination variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant="ablate_mlp_lex")
+
+
+def infer_adaptive_fusion_ablate_mlp_lex_test_pipeline(cfg: Any) -> None:
+    """Run the MLP + lexical-overlap combination variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant="ablate_mlp_lex")
+
+
+def train_adaptive_fusion_best_pipeline(cfg: Any) -> None:
+    """Train the configured current-best adaptive fusion variant."""
+    _train_adaptive_ablation_pipeline(cfg, variant=_resolve_best_adaptive_variant(cfg))
+
+
+def eval_adaptive_fusion_best_val_pipeline(cfg: Any) -> None:
+    """Evaluate the configured current-best adaptive fusion variant on val."""
+    _eval_adaptive_ablation_pipeline(cfg, variant=_resolve_best_adaptive_variant(cfg))
+
+
+def infer_adaptive_fusion_best_test_pipeline(cfg: Any) -> None:
+    """Run the configured current-best adaptive fusion variant on test."""
+    _infer_adaptive_ablation_test_pipeline(cfg, variant=_resolve_best_adaptive_variant(cfg))
+
+
+def train_adaptive_fusion_mlp_ocrq_bge_pipeline(cfg: Any) -> None:
+    """Train the current-best fusion structure with the upgraded OCR BGE route."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_mlp_ocrq_bge")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_mlp_ocrq_bge(cfg)
+    logger.info("adaptive_fusion_mlp_ocrq_bge training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_mlp_ocrq_bge_pipeline(cfg: Any) -> None:
+    """Evaluate the BGE-backed mlp_ocrq fusion variant on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_mlp_ocrq_bge_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_bge_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_bge_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_mlp_ocrq_bge_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_bge val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_bge val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_mlp_ocrq_bge_test_pipeline(cfg: Any) -> None:
+    """Run the BGE-backed mlp_ocrq fusion variant on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_mlp_ocrq_bge_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_bge_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_bge_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_bge test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_mlp_ocrq_bge test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_mlp_ocrq_chunk_pipeline(cfg: Any) -> None:
+    """Train the mlp_ocrq fusion variant with chunk-level OCR rerank."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_mlp_ocrq_chunk")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_mlp_ocrq_chunk(cfg)
+    logger.info("adaptive_fusion_mlp_ocrq_chunk training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_mlp_ocrq_chunk_pipeline(cfg: Any) -> None:
+    """Evaluate the chunk-backed mlp_ocrq fusion variant on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_mlp_ocrq_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_chunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_mlp_ocrq_chunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunk val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunk val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_mlp_ocrq_chunk_test_pipeline(cfg: Any) -> None:
+    """Run the chunk-backed mlp_ocrq fusion variant on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_mlp_ocrq_chunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_chunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_chunk_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunk test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_mlp_ocrq_chunk test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_visual_colqwen_ocr_chunk_pipeline(cfg: Any) -> None:
+    """Train the clean visual_colqwen + OCR chunk fusion baseline."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_visual_colqwen_ocr_chunk")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_visual_colqwen_ocr_chunk(cfg)
+    logger.info("adaptive_fusion_visual_colqwen_ocr_chunk training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_visual_colqwen_ocr_chunk_val_pipeline(cfg: Any) -> None:
+    """Evaluate the visual_colqwen + OCR chunk fusion baseline on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_visual_colqwen_ocr_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_colqwen_ocr_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_visual_colqwen_ocr_chunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_visual_colqwen_ocr_chunk val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_visual_colqwen_ocr_chunk val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_visual_colqwen_ocr_chunk_test_pipeline(cfg: Any) -> None:
+    """Run the visual_colqwen + OCR chunk fusion baseline on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_visual_colqwen_ocr_chunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_colqwen_ocr_chunk_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_visual_colqwen_ocr_chunk test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_visual_colqwen_ocr_chunk test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_mlp_ocrq_chunkplus_pipeline(cfg: Any) -> None:
+    """Train the chunkplus fusion variant with chunk-aware/question-aware features."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_mlp_ocrq_chunkplus")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_mlp_ocrq_chunkplus(cfg)
+    logger.info("adaptive_fusion_mlp_ocrq_chunkplus training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_mlp_ocrq_chunkplus_pipeline(cfg: Any) -> None:
+    """Evaluate the chunkplus fusion variant on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_mlp_ocrq_chunkplus_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_chunkplus_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_chunkplus_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_mlp_ocrq_chunkplus_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunkplus val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunkplus val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_mlp_ocrq_chunkplus_test_pipeline(cfg: Any) -> None:
+    """Run the chunkplus fusion variant on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_mlp_ocrq_chunkplus_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_chunkplus_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_chunkplus_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_chunkplus test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_mlp_ocrq_chunkplus test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_mlp_ocrq_hybrid_pipeline(cfg: Any) -> None:
+    """Train the mlp_ocrq fusion variant with hybrid OCR retrieval."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_mlp_ocrq_hybrid")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_mlp_ocrq_hybrid(cfg)
+    logger.info("adaptive_fusion_mlp_ocrq_hybrid training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def train_adaptive_fusion_mlp_ocrq_nvchunk_pipeline(cfg: Any) -> None:
+    """Train the mlp_ocrq fusion variant with NV chunk OCR retrieval."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_mlp_ocrq_nvchunk")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_fusion_mlp_ocrq_nvchunk(cfg)
+    logger.info("adaptive_fusion_mlp_ocrq_nvchunk training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_mlp_ocrq_hybrid_pipeline(cfg: Any) -> None:
+    """Evaluate the hybrid-backed mlp_ocrq fusion variant on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_mlp_ocrq_hybrid_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_hybrid_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_hybrid_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_mlp_ocrq_hybrid_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_hybrid val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_hybrid val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_mlp_ocrq_hybrid_test_pipeline(cfg: Any) -> None:
+    """Run the hybrid-backed mlp_ocrq fusion variant on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_mlp_ocrq_hybrid_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_hybrid_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_hybrid_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_hybrid test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_mlp_ocrq_hybrid test metrics: %s", metrics)
+
+
+def eval_adaptive_fusion_mlp_ocrq_nvchunk_pipeline(cfg: Any) -> None:
+    """Evaluate the NV-chunk-backed mlp_ocrq fusion variant on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_mlp_ocrq_nvchunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_nvchunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_nvchunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_mlp_ocrq_nvchunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_nvchunk val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_nvchunk val metrics to %s", metrics_path)
+
+
+def infer_adaptive_fusion_mlp_ocrq_nvchunk_test_pipeline(cfg: Any) -> None:
+    """Run the NV-chunk-backed mlp_ocrq fusion variant on test."""
+    logger = _build_logger(cfg, "infer_adaptive_fusion_mlp_ocrq_nvchunk_test")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_mlp_ocrq_nvchunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.test_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_mlp_ocrq_nvchunk_test_predictions.jsonl"
+    save_jsonl(predictions, prediction_path)
+    logger.info("Saved adaptive_fusion_mlp_ocrq_nvchunk test predictions to %s", prediction_path)
+    if metrics:
+        logger.info("adaptive_fusion_mlp_ocrq_nvchunk test metrics: %s", metrics)
+
+
 def train_fusion_pipeline(cfg: Any) -> None:
-    """Placeholder training pipeline for later adaptive fusion phases."""
+    """Train the adaptive fusion model."""
     logger = _build_logger(cfg, "train_fusion")
     _ensure_runtime_dirs(cfg)
-    logger.info("Fusion training is currently a placeholder beyond Phase 1.")
-    train_fusion(cfg)
+    metrics = train_fusion(cfg)
+    logger.info("Fusion training completed: %s", metrics)
 
 
 def infer_docvqa_pipeline(cfg: Any) -> None:
-    """Placeholder end-to-end DocVQA inference pipeline."""
+    """Run end-to-end DocVQA inference and save predictions."""
     logger = _build_logger(cfg, "infer_docvqa")
+    _ensure_runtime_dirs(cfg)
     dataset = _load_split_dataset(cfg, str(cfg.experiment.split))
-    predictions = [infer_docvqa_sample(sample) for sample in dataset]
-    save_json(predictions, Path(cfg.paths.prediction_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_docvqa_predictions.json")
-    logger.info("Saved placeholder DocVQA predictions for %d samples.", len(predictions))
+    processed_samples = list(dataset)
+    documents = collect_document_pages(cfg, processed_samples)
+    visual_retriever = ColPaliRetriever(cfg)
+    text_retriever = BM25Retriever(cfg)
+    build_visual_index(visual_retriever, documents)
+    build_text_index(text_retriever, documents)
+    retriever_manager = RetrieverManager(cfg, visual_retriever, text_retriever)
+    predictions = []
+    case_rows = []
+    for sample in processed_samples:
+        bundle = retriever_manager.retrieve(sample)
+        prediction = infer_docvqa_sample(cfg, sample, bundle, fusion_mode="adaptive_fusion", top_n=1)
+        predictions.append(prediction)
+        case_rows.append(
+            {
+                "question": sample["question"],
+                "evidence_page_ids": [_normalize_evidence_page_id(sample["doc_id"], page) for page in sample.get("evidence_pages", [])],
+                "visual_top_k": bundle["visual"].get("page_ids", []),
+                "ocr_top_k": bundle["text"].get("page_ids", []),
+                "fusion_top_k": prediction["retrieval"].get("page_ids", []),
+                "final_answer": prediction["predicted_answer"],
+            }
+        )
+    save_jsonl(predictions, Path(cfg.paths.prediction_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_docvqa_predictions.jsonl")
+    save_json(export_case_study(case_rows), Path(cfg.paths.prediction_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_case_study.json")
+    logger.info("DocVQA inference completed for %d samples.", len(predictions))
 
 
 def eval_docvqa_pipeline(cfg: Any) -> None:
-    """Placeholder end-to-end DocVQA evaluation pipeline."""
+    """Evaluate end-to-end DocVQA predictions with EM, F1, and ANLS."""
     logger = _build_logger(cfg, "eval_docvqa")
-    save_json({"status": "not_implemented"}, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_docvqa_metrics.json")
-    logger.info("DocVQA evaluation is reserved for Phase 4.")
+    prediction_path = Path(cfg.paths.prediction_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_docvqa_predictions.jsonl"
+    dataset = _load_split_dataset(cfg, str(cfg.experiment.split))
+    predictions = []
+    if prediction_path.exists():
+        from src.utils.io_utils import load_jsonl
+
+        predictions = load_jsonl(prediction_path)
+    else:
+        infer_docvqa_pipeline(cfg)
+        from src.utils.io_utils import load_jsonl
+
+        predictions = load_jsonl(prediction_path)
+    answers_by_qid = {sample["qid"]: sample.get("answer", "") for sample in dataset}
+    metrics = {
+        "EM": sum(exact_match(item.get("predicted_answer", ""), answers_by_qid.get(item["qid"], "")) for item in predictions) / max(len(predictions), 1),
+        "F1": sum(f1_score(item.get("predicted_answer", ""), answers_by_qid.get(item["qid"], "")) for item in predictions) / max(len(predictions), 1),
+        "ANLS": sum(anls(item.get("predicted_answer", ""), answers_by_qid.get(item["qid"], "")) for item in predictions) / max(len(predictions), 1),
+    }
+    save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_{cfg.experiment.split}_docvqa_metrics.json")
+    logger.info("DocVQA evaluation completed: %s", metrics)
 
 
 def _ensure_runtime_dirs(cfg: Any) -> None:
@@ -118,9 +1226,28 @@ def _should_skip(cfg: Any, target_path: Path) -> bool:
     return bool(cfg.runtime.use_cache) and not bool(cfg.runtime.overwrite_cache) and target_path.exists()
 
 
+def _should_skip_split(cfg: Any, processed_path: Path, report_path: Path) -> bool:
+    """Check whether a prepared split can be safely skipped."""
+    return (
+        bool(cfg.runtime.use_cache)
+        and not bool(cfg.runtime.overwrite_cache)
+        and processed_path.exists()
+        and report_path.exists()
+    )
+
+
 def _build_logger(cfg: Any, stage_name: str):
-    experiment_name = f"{cfg.experiment.name}_{stage_name}"
-    return setup_logger(stage_name, cfg.paths.log_dir, experiment_name)
+    log_file = Path(cfg.paths.log_dir) / f"{cfg.experiment.name}_{stage_name}.log"
+    return get_logger(stage_name, log_file=log_file)
+
+
+def _normalize_evidence_page_id(doc_id: str, evidence_page: Any) -> str:
+    """Normalize evidence-page annotations into canonical page ids."""
+    if isinstance(evidence_page, str) and "_page_" in evidence_page:
+        return evidence_page
+    if isinstance(evidence_page, str) and "_p" in evidence_page:
+        return evidence_page
+    return f"{doc_id}_p{int(evidence_page)}"
 
 
 def _load_split_dataset(cfg: Any, split: str) -> DocVQADataset:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from utils.rank_utils import sort_pages_by_score
-from utils.score_utils import align_retriever_scores
+from src.utils.rank_utils import sort_pages_by_score
+from src.utils.score_utils import align_retriever_scores
 
 
 class FixedFusion:
