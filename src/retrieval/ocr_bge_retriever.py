@@ -134,13 +134,16 @@ def _normalize_tokens(tokens: list[str]) -> list[str]:
 class OCRBGERetriever(OCRRetriever):
     """Document-scoped dense OCR retriever using BGE-style text embeddings."""
 
-    def __init__(self, cfg: Any) -> None:
+    def __init__(self, cfg: Any, config_attr: str = "ocr_retrieval") -> None:
         self.cfg = cfg
-        self.model_name = str(cfg.ocr_retrieval.bge_model_name)
-        self.device = str(cfg.ocr_retrieval.device)
-        self.local_files_only = bool(cfg.ocr_retrieval.local_files_only)
-        self.batch_size = int(cfg.ocr_retrieval.batch_size)
-        self.max_length = int(cfg.ocr_retrieval.max_length)
+        self.config_attr = str(config_attr)
+        config = getattr(cfg, self.config_attr)
+        model_name = getattr(config, "model_name", None) or getattr(config, "bge_model_name", None)
+        self.model_name = str(model_name)
+        self.device = str(getattr(config, "device"))
+        self.local_files_only = bool(getattr(config, "local_files_only"))
+        self.batch_size = int(getattr(config, "batch_size", 8))
+        self.max_length = int(getattr(config, "max_length", 512))
         self.logger = get_logger("ocr_bge_retriever")
         self.index: dict[str, dict[str, Any]] = {}
         self._tokenizer = None
@@ -170,6 +173,43 @@ class OCRBGERetriever(OCRRetriever):
         ranked_indices = np.argsort(scores)[::-1][:topk]
         return {
             "page_ids": [int(self.index[doc_id]["page_ids"][idx]) for idx in ranked_indices],
+            "scores": [float(scores[idx]) for idx in ranked_indices],
+            "ranks": list(range(1, len(ranked_indices) + 1)),
+        }
+
+    def retrieve_subset(
+        self,
+        query: str,
+        doc_id: str,
+        candidate_page_ids: list[int],
+        topk: int | None = None,
+    ) -> dict[str, list]:
+        """Retrieve and rank only a routed subset of OCR pages from an indexed document."""
+        if doc_id not in self.index:
+            return {"page_ids": [], "scores": [], "ranks": []}
+        candidate_page_set = {int(page_id) for page_id in candidate_page_ids}
+        if not candidate_page_set:
+            return {"page_ids": [], "scores": [], "ranks": []}
+
+        doc_page_ids = self.index[doc_id]["page_ids"]
+        page_embeddings = self.index[doc_id]["embeddings"]
+        filtered_page_ids: list[int] = []
+        filtered_embeddings: list[Any] = []
+        for page_id, embedding in zip(doc_page_ids, page_embeddings):
+            if int(page_id) in candidate_page_set:
+                filtered_page_ids.append(int(page_id))
+                filtered_embeddings.append(embedding)
+        if not filtered_page_ids:
+            return {"page_ids": [], "scores": [], "ranks": []}
+
+        self._ensure_model()
+        query_embedding = self._encode_texts([query])[0]
+        embedding_matrix = np.stack(filtered_embeddings, axis=0)
+        scores = embedding_matrix @ query_embedding
+        effective_topk = len(filtered_page_ids) if topk is None else min(int(topk), len(filtered_page_ids))
+        ranked_indices = np.argsort(scores)[::-1][:effective_topk]
+        return {
+            "page_ids": [int(filtered_page_ids[idx]) for idx in ranked_indices],
             "scores": [float(scores[idx]) for idx in ranked_indices],
             "ranks": list(range(1, len(ranked_indices) + 1)),
         }

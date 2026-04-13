@@ -139,6 +139,25 @@ class ColQwenRetrieverRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "base model directory not found"):
             retriever._resolve_runtime_paths()
 
+    def test_retrieve_subset_only_scores_requested_pages(self):
+        retriever = self._build_retriever(self._make_complete_model_dir("colqwen-complete"))
+        retriever._engine_loaded = True
+        retriever.index["doc-1"] = {
+            "page_ids": [0, 1, 2],
+            "embeddings": ["emb0", "emb1", "emb2"],
+        }
+
+        with mock.patch.object(retriever, "_encode_query_embedding", return_value="query_emb"), mock.patch.object(
+            retriever,
+            "_score_query_against_document",
+            return_value=[0.2, 0.8],
+        ) as score_mock:
+            result = retriever.retrieve_subset("invoice total", "doc-1", [1, 2], topk=None)
+
+        self.assertEqual(result["page_ids"], [2, 1])
+        self.assertEqual(result["ranks"], [1, 2])
+        score_mock.assert_called_once_with("query_emb", ["emb1", "emb2"])
+
     def _build_retriever(self, model_dir: Path, base_model_name: str | None = None) -> ColQwenRetriever:
         cfg = types.SimpleNamespace(
             visual_colqwen_retrieval=types.SimpleNamespace(

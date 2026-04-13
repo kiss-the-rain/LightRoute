@@ -8,6 +8,36 @@ retrieval:
   score_normalization_method: minmax
   cache_predictions: true
 
+retrieval_router:
+  enable_adaptive_coarse: true
+  bypass_threshold: 40
+  coarse_topk: 50
+  coarse_method: bm25
+
+ocr_router:
+  enable_ocr_page_coarse: true
+  bypass_threshold: 40
+  coarse_topk: 50
+  coarse_method: bm25
+
+ocr_semantic_retrieval:
+  enable_bge_m3: true
+  model_name: /home/cuizhibin/projects/Models/bge-m3
+  local_files_only: true
+  device: cuda:0
+  batch_size: 8
+  max_length: 1024
+  semantic_topk: 30
+
+ocr_reranker:
+  enable_bge_reranker: true
+  model_name: /home/cuizhibin/projects/Models/bge-reranker-v2-m3
+  local_files_only: true
+  device: cuda:0
+  batch_size: 8
+  max_length: 1024
+  rerank_topk: 10
+
 visual_retriever:
   type: colpali_stub
   embedding_dim: 128

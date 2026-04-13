@@ -40,6 +40,9 @@ from src.pipeline import (  # noqa: E402
     eval_ocr_hybrid_pipeline,
     eval_ocr_jina_chunk_pipeline,
     eval_ocr_nv_chunk_pipeline,
+    eval_ocr_page_bm25_bge_rerank_pipeline,
+    eval_ocr_page_coarse_chunk_pipeline,
+    eval_visual_colqwen_adaptive_coarse_retrieval_pipeline,
     eval_visual_colqwen_retrieval_pipeline,
     eval_fixed_fusion_pipeline,
     eval_retrieval_pipeline,
@@ -134,8 +137,11 @@ def parse_args() -> argparse.Namespace:
             "eval_ocr_hybrid_val",
             "eval_ocr_jina_chunk_val",
             "eval_ocr_nv_chunk_val",
+            "eval_ocr_page_coarse_chunk_val",
+            "eval_ocr_page_bm25_bge_rerank_val",
             "eval_visual_val",
             "eval_visual_colqwen_val",
+            "eval_visual_colqwen_adaptive_coarse_val",
             "eval_fixed_fusion_val",
             "eval_rrf_val",
             "train_adaptive_fusion",
@@ -217,6 +223,10 @@ def main() -> None:
             cfg.visual.device = args.device
         if hasattr(cfg, "ocr_retrieval"):
             cfg.ocr_retrieval.device = args.device
+        if hasattr(cfg, "ocr_semantic_retrieval"):
+            cfg.ocr_semantic_retrieval.device = args.device
+        if hasattr(cfg, "ocr_reranker"):
+            cfg.ocr_reranker.device = args.device
         if hasattr(cfg, "ocr_nv_retrieval"):
             cfg.ocr_nv_retrieval.device = args.device
         if hasattr(cfg, "ocr_jina_retrieval"):
@@ -241,8 +251,11 @@ def main() -> None:
         "eval_ocr_hybrid_val": eval_ocr_hybrid_pipeline,
         "eval_ocr_jina_chunk_val": eval_ocr_jina_chunk_pipeline,
         "eval_ocr_nv_chunk_val": eval_ocr_nv_chunk_pipeline,
+        "eval_ocr_page_coarse_chunk_val": eval_ocr_page_coarse_chunk_pipeline,
+        "eval_ocr_page_bm25_bge_rerank_val": eval_ocr_page_bm25_bge_rerank_pipeline,
         "eval_visual_val": eval_visual_retrieval_pipeline,
         "eval_visual_colqwen_val": eval_visual_colqwen_retrieval_pipeline,
+        "eval_visual_colqwen_adaptive_coarse_val": eval_visual_colqwen_adaptive_coarse_retrieval_pipeline,
         "eval_fixed_fusion_val": eval_fixed_fusion_pipeline,
         "eval_rrf_val": eval_rrf_pipeline,
         "train_adaptive_fusion": train_adaptive_fusion_pipeline,

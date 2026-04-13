@@ -770,7 +770,7 @@ def build_candidate_features_visual_colqwen_ocr_chunk(
     ocr_quality_cache: dict[str, dict[int, dict[str, float]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the stable mlp_ocrq feature set using ColQwen visual route + OCR chunk route."""
-    return build_candidate_features_ablate_mlp_ocrq(
+    rows = build_candidate_features_ablate_mlp_ocrq(
         sample,
         ocr_result,
         visual_result,
@@ -778,6 +778,16 @@ def build_candidate_features_visual_colqwen_ocr_chunk(
         question_encoder=question_encoder,
         ocr_quality_cache=ocr_quality_cache,
     )
+    adaptive_coarse_meta = visual_result.get("adaptive_coarse", {}) or {}
+    ocr_page_coarse_meta = ocr_result.get("ocr_page_coarse", {}) or {}
+    for row in rows:
+        row["adaptive_coarse_bypassed"] = float(int(bool(adaptive_coarse_meta.get("bypassed", False))))
+        row["adaptive_coarse_num_pages_before"] = float(adaptive_coarse_meta.get("num_pages_before", 0))
+        row["adaptive_coarse_num_pages_after"] = float(adaptive_coarse_meta.get("num_pages_after", 0))
+        row["ocr_page_coarse_bypassed"] = float(int(bool(ocr_page_coarse_meta.get("bypassed", False))))
+        row["ocr_page_coarse_num_pages_before"] = float(ocr_page_coarse_meta.get("num_pages_before", 0))
+        row["ocr_page_coarse_num_pages_after"] = float(ocr_page_coarse_meta.get("num_pages_after", 0))
+    return rows
 
 
 def _build_candidate_features_ablation(

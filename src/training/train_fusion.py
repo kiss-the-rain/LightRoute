@@ -9,12 +9,22 @@ from tqdm import tqdm
 
 from src.evaluation.retrieval_metrics import evaluate_retrieval
 from src.inference.infer_retrieval import (
+    add_ocr_bm25_metric_aliases,
+    _accumulate_adaptive_coarse_metrics,
+    _accumulate_ocr_page_pipeline_metrics,
+    _build_adaptive_coarse_metric_accumulator,
+    _build_ocr_page_pipeline_metric_accumulator,
     _retrieve_bm25_for_sample,
     _retrieve_ocr_bge_for_sample,
     _retrieve_ocr_bge_chunk_for_sample,
+    _retrieve_ocr_with_bm25_bge_reranker_for_sample,
+    _retrieve_ocr_with_page_coarse_for_sample,
     _retrieve_ocr_hybrid_for_sample,
     _retrieve_ocr_nv_chunk_for_sample,
     _retrieve_visual_for_sample,
+    _retrieve_visual_with_adaptive_coarse_for_sample,
+    summarize_ocr_page_pipeline_metrics,
+    summarize_adaptive_coarse_stats,
 )
 from src.models.adaptive_fusion import AdaptiveFusion, AdaptiveFusionV2
 from src.models.question_encoder import QuestionEncoder
@@ -160,10 +170,12 @@ def train_fusion_visual_colqwen_ocr_chunk(cfg: Any) -> dict[str, Any]:
     """Train the stable mlp_ocrq chunk fusion with ColQwen as the visual backbone."""
     return train_fusion_mlp_ocrq_with_backend(
         cfg,
-        ocr_backend="bge_chunk_rerank",
+        ocr_backend="ocr_page_bm25_bge_rerank",
         visual_backend="colqwen",
         variant_name="visual_colqwen_ocr_chunk",
         feature_builder=build_candidate_features_visual_colqwen_ocr_chunk,
+        use_adaptive_coarse_visual=True,
+        use_ocr_page_coarse=True,
     )
 
 
@@ -193,6 +205,8 @@ def train_fusion_mlp_ocrq_with_backend(
     visual_backend: str = "colpali",
     variant_name: str | None = None,
     feature_builder: Any = build_candidate_features_ablate_mlp_ocrq,
+    use_adaptive_coarse_visual: bool = False,
+    use_ocr_page_coarse: bool = False,
 ) -> dict[str, Any]:
     """Train the current-best fusion structure with a selectable OCR retrieval backend."""
     backend_settings = {
@@ -223,6 +237,13 @@ def train_fusion_mlp_ocrq_with_backend(
             "prediction_filename": "adaptive_fusion_mlp_ocrq_nvchunk_val_predictions.jsonl",
             "metric_filename": "adaptive_fusion_mlp_ocrq_nvchunk_val_metrics.json",
             "train_metric_filename": f"{cfg.experiment.name}_train_adaptive_fusion_mlp_ocrq_nvchunk_metrics.json",
+        },
+        "ocr_page_bm25_bge_rerank": {
+            "logger_name": "train_adaptive_fusion_visual_colqwen_ocr_chunk",
+            "checkpoint_subdir": "adaptive_fusion_visual_colqwen_ocr_chunk",
+            "prediction_filename": "adaptive_fusion_visual_colqwen_ocr_chunk_val_predictions.jsonl",
+            "metric_filename": "adaptive_fusion_visual_colqwen_ocr_chunk_val_metrics.json",
+            "train_metric_filename": f"{cfg.experiment.name}_train_adaptive_fusion_visual_colqwen_ocr_chunk_metrics.json",
         },
     }
     variant_overrides = {
@@ -256,6 +277,8 @@ def train_fusion_mlp_ocrq_with_backend(
         feature_builder=feature_builder,
         ocr_backend=ocr_backend,
         visual_backend=visual_backend,
+        use_adaptive_coarse_visual=use_adaptive_coarse_visual,
+        use_ocr_page_coarse=use_ocr_page_coarse,
     )
 
 
@@ -270,9 +293,31 @@ def _train_fusion_variant(
     feature_builder: Any,
     ocr_backend: str = "bm25",
     visual_backend: str = "colpali",
+    use_adaptive_coarse_visual: bool = False,
+    use_ocr_page_coarse: bool = False,
 ) -> dict[str, Any]:
     """Shared training pipeline for adaptive fusion variants."""
+    if visual_backend == "old_visual":
+        visual_backend = "colpali"
     logger = get_logger(logger_name, log_file=Path(cfg.paths.log_dir) / f"{cfg.experiment.name}_{checkpoint_subdir}.log")
+    visual_router_cfg = getattr(cfg, "retrieval_router", None)
+    ocr_router_cfg = getattr(cfg, "ocr_router", None)
+    ocr_semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
+    ocr_reranker_cfg = getattr(cfg, "ocr_reranker", None)
+    logger.info(
+        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bypass_threshold=%s visual_coarse_topk=%s "
+        "ocr_page_coarse=%s ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
+        visual_backend,
+        ocr_backend,
+        bool(use_adaptive_coarse_visual and getattr(visual_router_cfg, "enable_adaptive_coarse", False)),
+        int(getattr(visual_router_cfg, "bypass_threshold", 0) or 0),
+        int(getattr(visual_router_cfg, "coarse_topk", 0) or 0),
+        bool(use_ocr_page_coarse and getattr(ocr_router_cfg, "enable_ocr_page_coarse", False)),
+        int(getattr(ocr_router_cfg, "bypass_threshold", 0) or 0),
+        int(getattr(ocr_router_cfg, "coarse_topk", 0) or 0),
+        int(getattr(ocr_semantic_cfg, "semantic_topk", 0) or 0),
+        int(getattr(ocr_reranker_cfg, "rerank_topk", 0) or 0),
+    )
     logger.info("Loading processed train split from %s", cfg.dataset.processed_files["train"])
     train_dataset = load_jsonl(cfg.dataset.processed_files["train"]) if Path(cfg.dataset.processed_files["train"]).exists() else []
     logger.info("Loading processed val split from %s", cfg.dataset.processed_files["val"])
@@ -296,9 +341,19 @@ def _train_fusion_variant(
     cfg.training.checkpoint_dir = str(checkpoint_dir)
     question_encoder = QuestionEncoder()
     bm25_text_cache: dict[str, list[str]] = {}
+    visual_coarse_text_cache: dict[str, list[str]] = {}
     bm25_retriever_cache: dict[str, Any] = {}
+    coarse_bm25_retriever_cache: dict[str, Any] = {}
+    ocr_coarse_text_cache: dict[str, list[str]] = {}
+    ocr_coarse_retriever_cache: dict[str, Any] = {}
     ocr_bge_retriever = OCRBGERetriever(cfg) if ocr_backend == "bge_rerank" else None
     ocr_bge_reranker = OCRBGEReranker(cfg) if ocr_backend == "bge_rerank" else None
+    ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval") if ocr_backend == "ocr_page_bm25_bge_rerank" else None
+    ocr_page_reranker = (
+        OCRBGEReranker(cfg, config_attr="ocr_reranker")
+        if ocr_backend == "ocr_page_bm25_bge_rerank" and bool(getattr(ocr_reranker_cfg, "enable_bge_reranker", True))
+        else None
+    )
     ocr_bge_indexed_docs: set[str] = set()
     chunk_builder = (
         OCRChunkBuilder(
@@ -320,7 +375,7 @@ def _train_fusion_variant(
     visual_indexed_docs: set[str] = set()
     ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
 
-    train_batches = _build_training_batches(
+    train_batches, train_batch_stats = _build_training_batches(
         cfg,
         train_dataset,
         question_encoder,
@@ -335,6 +390,8 @@ def _train_fusion_variant(
         visual_backend=visual_backend,
         ocr_bge_retriever=ocr_bge_retriever,
         ocr_bge_reranker=ocr_bge_reranker,
+        ocr_page_retriever=ocr_page_retriever,
+        ocr_page_reranker=ocr_page_reranker,
         ocr_bge_indexed_docs=ocr_bge_indexed_docs,
         chunk_builder=chunk_builder,
         ocr_chunk_retriever=ocr_chunk_retriever,
@@ -344,8 +401,15 @@ def _train_fusion_variant(
         ocr_hybrid_retriever=ocr_hybrid_retriever,
         ocr_nv_chunk_retriever=ocr_nv_chunk_retriever,
         ocr_nv_chunk_indexed_docs=ocr_nv_chunk_indexed_docs,
+        coarse_bm25_retriever_cache=coarse_bm25_retriever_cache,
+        use_adaptive_coarse_visual=use_adaptive_coarse_visual,
+        use_ocr_page_coarse=use_ocr_page_coarse,
+        require_positive_candidate=use_adaptive_coarse_visual,
+        visual_coarse_text_cache=visual_coarse_text_cache,
+        ocr_coarse_text_cache=ocr_coarse_text_cache,
+        ocr_coarse_retriever_cache=ocr_coarse_retriever_cache,
     )
-    val_batches = _build_training_batches(
+    val_batches, val_batch_stats = _build_training_batches(
         cfg,
         val_dataset,
         question_encoder,
@@ -360,6 +424,8 @@ def _train_fusion_variant(
         visual_backend=visual_backend,
         ocr_bge_retriever=ocr_bge_retriever,
         ocr_bge_reranker=ocr_bge_reranker,
+        ocr_page_retriever=ocr_page_retriever,
+        ocr_page_reranker=ocr_page_reranker,
         ocr_bge_indexed_docs=ocr_bge_indexed_docs,
         chunk_builder=chunk_builder,
         ocr_chunk_retriever=ocr_chunk_retriever,
@@ -369,9 +435,21 @@ def _train_fusion_variant(
         ocr_hybrid_retriever=ocr_hybrid_retriever,
         ocr_nv_chunk_retriever=ocr_nv_chunk_retriever,
         ocr_nv_chunk_indexed_docs=ocr_nv_chunk_indexed_docs,
+        coarse_bm25_retriever_cache=coarse_bm25_retriever_cache,
+        use_adaptive_coarse_visual=use_adaptive_coarse_visual,
+        use_ocr_page_coarse=use_ocr_page_coarse,
+        require_positive_candidate=use_adaptive_coarse_visual,
+        visual_coarse_text_cache=visual_coarse_text_cache,
+        ocr_coarse_text_cache=ocr_coarse_text_cache,
+        ocr_coarse_retriever_cache=ocr_coarse_retriever_cache,
     )
     if not train_batches or not val_batches:
-        metrics = {"status": "skipped", "reason": "adaptive fusion candidate batches are empty"}
+        metrics = {
+            "status": "skipped",
+            "reason": "adaptive fusion candidate batches are empty",
+            "train_batch_stats": train_batch_stats,
+            "val_batch_stats": val_batch_stats,
+        }
         save_json(metrics, Path(cfg.paths.metric_dir) / train_metric_filename)
         return metrics
 
@@ -398,6 +476,8 @@ def _train_fusion_variant(
     metrics = {
         **train_metrics,
         "checkpoint_path": str(checkpoint_dir / best_name),
+        "train_batch_stats": train_batch_stats,
+        "val_batch_stats": val_batch_stats,
         "val_retrieval_metrics": retrieval_metrics,
     }
     save_json(metrics, Path(cfg.paths.metric_dir) / train_metric_filename)
@@ -420,6 +500,8 @@ def _build_training_batches(
     visual_backend: str,
     ocr_bge_retriever: OCRBGERetriever | None,
     ocr_bge_reranker: OCRBGEReranker | None,
+    ocr_page_retriever: OCRBGERetriever | None,
+    ocr_page_reranker: OCRBGEReranker | None,
     ocr_bge_indexed_docs: set[str],
     chunk_builder: OCRChunkBuilder | None,
     ocr_chunk_retriever: OCRBGEChunkRetriever | None,
@@ -429,11 +511,33 @@ def _build_training_batches(
     ocr_hybrid_retriever: OCRHybridRetriever | None,
     ocr_nv_chunk_retriever: OCRNVChunkRetriever | None,
     ocr_nv_chunk_indexed_docs: set[str],
-) -> list[dict[str, Any]]:
+    coarse_bm25_retriever_cache: dict[str, Any],
+    use_adaptive_coarse_visual: bool = False,
+    use_ocr_page_coarse: bool = False,
+    require_positive_candidate: bool = False,
+    visual_coarse_text_cache: dict[str, list[str]] | None = None,
+    ocr_coarse_text_cache: dict[str, list[str]] | None = None,
+    ocr_coarse_retriever_cache: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build candidate-level training batches from OCR and visual retrieval results."""
+    if visual_backend == "old_visual":
+        visual_backend = "colpali"
     if visual_backend not in {"colpali", "colqwen"}:
         raise ValueError(f"Unsupported visual backend for training batches: {visual_backend}")
     batches: list[dict[str, Any]] = []
+    stats = {
+        "num_samples": len(dataset),
+        "num_built_batches": 0,
+        "skipped_empty_candidates": 0,
+        "skipped_missing_positive": 0,
+    }
+    visual_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="retrieval_router", stats_prefix="visual") if use_adaptive_coarse_visual else {}
+    ocr_stats_prefix = "ocr_bm25" if ocr_backend == "ocr_page_bm25_bge_rerank" else "ocr"
+    ocr_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="ocr_router", stats_prefix=ocr_stats_prefix) if use_ocr_page_coarse else {}
+    ocr_page_pipeline_stats = _build_ocr_page_pipeline_metric_accumulator() if ocr_backend == "ocr_page_bm25_bge_rerank" else {}
+    visual_coarse_text_cache = visual_coarse_text_cache or {}
+    ocr_coarse_text_cache = ocr_coarse_text_cache or {}
+    ocr_coarse_retriever_cache = ocr_coarse_retriever_cache or {}
     split_name = "train" if dataset and str(dataset[0].get("qid", "")).startswith("train_") else "val"
     for sample in tqdm(dataset, desc=f"BuildAdaptiveBatches {split_name}", unit="sample"):
         doc_id = str(sample["doc_id"])
@@ -449,23 +553,58 @@ def _build_training_batches(
                 coarse_topn=int(cfg.ocr_retrieval.coarse_topn),
             )
             ocr_page_texts = ocr_bge_retriever.get_document_page_texts(doc_id)
-        elif ocr_backend == "bge_chunk_rerank":
-            assert chunk_builder is not None and ocr_chunk_retriever is not None and ocr_chunk_reranker is not None
-            ocr_result, _ = _retrieve_ocr_bge_chunk_for_sample(
+        elif ocr_backend == "ocr_page_bm25_bge_rerank":
+            assert ocr_page_retriever is not None
+            ocr_result, ocr_stats = _retrieve_ocr_with_bm25_bge_reranker_for_sample(
                 cfg=cfg,
                 sample=sample,
                 topk=int(cfg.retrieval.topk),
-                chunk_builder=chunk_builder,
-                retriever=ocr_chunk_retriever,
-                indexed_docs=ocr_chunk_indexed_docs,
-                reranker=ocr_chunk_reranker,
-                chunk_cache=ocr_chunk_cache,
-                coarse_topn=int(cfg.ocr_chunk_retrieval.coarse_topn),
-                aggregation_strategy=str(cfg.ocr_chunk_retrieval.aggregate_strategy),
-                query_variant=str(cfg.ocr_chunk_retrieval.query_variant),
-                collect_chunk_stats=False,
+                retriever=ocr_page_retriever,
+                indexed_docs=ocr_bge_indexed_docs,
+                reranker=ocr_page_reranker,
+                bm25_doc_text_cache=ocr_coarse_text_cache,
+                bm25_doc_retriever_cache=ocr_coarse_retriever_cache,
             )
-            ocr_page_texts = bm25_text_cache.get(doc_id)
+            if use_ocr_page_coarse:
+                _accumulate_adaptive_coarse_metrics(ocr_coarse_stats, ocr_stats, stats_prefix=ocr_stats_prefix)
+            _accumulate_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, ocr_stats)
+            ocr_page_texts = ocr_coarse_text_cache.get(doc_id)
+        elif ocr_backend == "bge_chunk_rerank":
+            assert chunk_builder is not None and ocr_chunk_retriever is not None and ocr_chunk_reranker is not None
+            if use_ocr_page_coarse:
+                ocr_result, ocr_stats = _retrieve_ocr_with_page_coarse_for_sample(
+                    cfg=cfg,
+                    sample=sample,
+                    topk=int(cfg.retrieval.topk),
+                    chunk_builder=chunk_builder,
+                    retriever=ocr_chunk_retriever,
+                    indexed_docs=ocr_chunk_indexed_docs,
+                    reranker=ocr_chunk_reranker,
+                    chunk_cache=ocr_chunk_cache,
+                    coarse_doc_text_cache=ocr_coarse_text_cache,
+                    coarse_doc_retriever_cache=ocr_coarse_retriever_cache,
+                    coarse_topn=int(cfg.ocr_chunk_retrieval.coarse_topn),
+                    aggregation_strategy=str(cfg.ocr_chunk_retrieval.aggregate_strategy),
+                    query_variant=str(cfg.ocr_chunk_retrieval.query_variant),
+                )
+                _accumulate_adaptive_coarse_metrics(ocr_coarse_stats, ocr_stats, stats_prefix=ocr_stats_prefix)
+                ocr_page_texts = ocr_coarse_text_cache.get(doc_id)
+            else:
+                ocr_result, _ = _retrieve_ocr_bge_chunk_for_sample(
+                    cfg=cfg,
+                    sample=sample,
+                    topk=int(cfg.retrieval.topk),
+                    chunk_builder=chunk_builder,
+                    retriever=ocr_chunk_retriever,
+                    indexed_docs=ocr_chunk_indexed_docs,
+                    reranker=ocr_chunk_reranker,
+                    chunk_cache=ocr_chunk_cache,
+                    coarse_topn=int(cfg.ocr_chunk_retrieval.coarse_topn),
+                    aggregation_strategy=str(cfg.ocr_chunk_retrieval.aggregate_strategy),
+                    query_variant=str(cfg.ocr_chunk_retrieval.query_variant),
+                    collect_chunk_stats=False,
+                )
+                ocr_page_texts = bm25_text_cache.get(doc_id)
             if ocr_page_texts is None:
                 ocr_page_texts = [load_page_ocr_text(path) for path in sample.get("ocr_paths", [])]
                 bm25_text_cache[doc_id] = ocr_page_texts
@@ -501,13 +640,24 @@ def _build_training_batches(
         else:
             ocr_result, _ = _retrieve_bm25_for_sample(sample, int(cfg.retrieval.topk), bm25_text_cache, bm25_retriever_cache)
             ocr_page_texts = bm25_text_cache.get(doc_id, [])
-        visual_result, _ = _retrieve_visual_for_sample(
-            cfg,
-            sample,
-            int(cfg.retrieval.topk),
-            visual_retriever,
-            visual_indexed_docs,
-        )
+        if use_adaptive_coarse_visual:
+            visual_result, visual_stats = _retrieve_visual_with_adaptive_coarse_for_sample(
+                cfg=cfg,
+                sample=sample,
+                retriever=visual_retriever,
+                indexed_docs=visual_indexed_docs,
+                coarse_doc_text_cache=visual_coarse_text_cache,
+                coarse_doc_retriever_cache=coarse_bm25_retriever_cache,
+            )
+            _accumulate_adaptive_coarse_metrics(visual_coarse_stats, visual_stats, stats_prefix="visual")
+        else:
+            visual_result, _ = _retrieve_visual_for_sample(
+                cfg,
+                sample,
+                int(cfg.retrieval.topk),
+                visual_retriever,
+                visual_indexed_docs,
+            )
         candidate_rows = feature_builder(
             sample,
             ocr_result,
@@ -518,8 +668,18 @@ def _build_training_batches(
         )
         if not candidate_rows:
             logger.warning("Skipping empty adaptive-fusion candidate set. qid=%s doc_id=%s", sample.get("qid"), sample.get("doc_id"))
+            stats["skipped_empty_candidates"] += 1
             continue
-        labels = [1.0 if int(row["page_id"]) in {int(page) for page in sample.get("evidence_pages", [])} else 0.0 for row in candidate_rows]
+        evidence_pages = {int(page) for page in sample.get("evidence_pages", [])}
+        labels = [1.0 if int(row["page_id"]) in evidence_pages else 0.0 for row in candidate_rows]
+        if require_positive_candidate and evidence_pages and not any(label > 0 for label in labels):
+            logger.warning(
+                "Skipping batch without positive candidate after adaptive routing. qid=%s doc_id=%s",
+                sample.get("qid"),
+                sample.get("doc_id"),
+            )
+            stats["skipped_missing_positive"] += 1
+            continue
         batches.append(
             {
                 "qid": sample["qid"],
@@ -531,12 +691,21 @@ def _build_training_batches(
                 "labels": labels,
             }
         )
-    return batches
+    stats["num_built_batches"] = len(batches)
+    if use_adaptive_coarse_visual:
+        stats.update(summarize_adaptive_coarse_stats(visual_coarse_stats, len(dataset), stats_prefix="visual"))
+    if use_ocr_page_coarse:
+        stats.update(summarize_adaptive_coarse_stats(ocr_coarse_stats, len(dataset), stats_prefix=ocr_stats_prefix))
+        if ocr_stats_prefix == "ocr_bm25":
+            stats.update(add_ocr_bm25_metric_aliases(stats))
+    if ocr_page_pipeline_stats:
+        stats.update(summarize_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, len(dataset)))
+    return batches, stats
 
 
 def _create_visual_retriever(cfg: Any, visual_backend: str) -> Any:
     """Create the requested visual retriever backend for fusion training."""
-    if visual_backend == "colpali":
+    if visual_backend in {"colpali", "old_visual"}:
         return ColPaliRetriever(cfg, require_engine=True)
     if visual_backend == "colqwen":
         return ColQwenRetriever(cfg)

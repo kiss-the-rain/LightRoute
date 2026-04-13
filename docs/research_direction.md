@@ -1,41 +1,31 @@
 # Research Direction
 
-## Stage-1 Conclusion
+## Stage-1
 
-- 在旧 visual backbone 下，chunk-level OCR route 接入 adaptive fusion 是有效的。
+- 在旧 visual backbone 下，chunk OCR + adaptive fusion 是有效的。
 - `adaptive_fusion_mlp_ocrq_chunk` 超过了旧版 `adaptive_fusion_ablate_mlp_ocrq`，说明 OCR 路增强的关键在于 chunk-level 建模。
 
-## Stage-2 Conclusion
+## Stage-2
 
-- 更强的 OCR-free visual retriever `visual_colqwen` 已显著提高页级检索性能。
-- `visual_colqwen` 不仅超过旧 visual-only，也明显超过当前所有旧 fusion 结果。
+- 更强的 `visual_colqwen` 显著提升了单路页级检索性能。
+- `visual_colqwen` 已明显超过 old visual-only，也明显超过当前所有旧 fusion 结果。
 
-## Current Core Question
+## Current Stage
 
-当前项目不再把“超过旧 visual-only”作为核心目标。新的核心问题是：
+- 当前核心问题不再是“超过 old visual-only”。
+- 当前阶段的重点是研究 `visual_colqwen + OCR chunk` 是否仍有互补性。
+- 若该新主线不能超过 `visual_colqwen-only`，则说明 OCR 路在强 visual backbone 下的边际收益可能已经有限。
 
-- 更强 OCR-free visual retriever 已经显著提高页级检索性能；
-- 下一步重点是研究：
-  - `visual_colqwen + OCR chunk` 是否仍然具有互补性
-  - 若无明显增益，是否说明 OCR 路在强视觉 backbone 下的价值已接近饱和
+## Next Step
 
-## Immediate Priority
+Next priority:
 
-- 新增并测试 `adaptive_fusion_visual_colqwen_ocr_chunk`
-- 用它与以下三类结果直接比较：
-  - `visual_colqwen-only`
-  - `adaptive_fusion_mlp_ocrq_chunk`
-  - `BGE chunk OCR-only`
+1. `train_adaptive_fusion_visual_colqwen_ocr_chunk`
+2. `eval_adaptive_fusion_visual_colqwen_ocr_chunk_val`
 
-## Decision Rule
+对应命令：
 
-- 若 `adaptive_fusion_visual_colqwen_ocr_chunk` 超过 `visual_colqwen-only`：
-  - 说明 OCR chunk 路在强视觉 backbone 下仍有稳定互补价值
-  - 可继续沿该双路主线细化
-
-- 若 `adaptive_fusion_visual_colqwen_ocr_chunk` 未超过 `visual_colqwen-only`：
-  - 说明 OCR 路在强视觉 backbone 下的边际增益有限
-  - 后续研究更适合转向：
-    - evidence chunk selection
-    - lightweight reader
-    - retrieval-then-read 两阶段 DocVQA 系统
+```bash
+python -m src.main --mode train_adaptive_fusion_visual_colqwen_ocr_chunk --device cuda:0
+python -m src.main --mode eval_adaptive_fusion_visual_colqwen_ocr_chunk_val --device cuda:0
+```

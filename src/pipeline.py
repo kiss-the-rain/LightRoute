@@ -44,12 +44,15 @@ from src.inference.infer_retrieval import (
     run_bm25_retrieval_on_dataset,
     run_ocr_bge_debug_on_dataset,
     run_ocr_bge_chunk_retrieval_on_dataset,
+    run_ocr_page_bm25_bge_rerank_on_dataset,
+    run_ocr_page_coarse_chunk_on_dataset,
     run_ocr_bge_retrieval_on_dataset,
     run_ocr_hybrid_retrieval_on_dataset,
     run_ocr_jina_chunk_retrieval_on_dataset,
     run_ocr_nv_chunk_retrieval_on_dataset,
     run_fixed_fusion_on_dataset,
     run_rrf_fusion_on_dataset,
+    run_visual_colqwen_adaptive_coarse_on_dataset,
     run_visual_colqwen_retrieval_on_dataset,
     run_visual_retrieval_on_dataset,
 )
@@ -503,6 +506,63 @@ def eval_visual_colqwen_retrieval_pipeline(cfg: Any) -> None:
     logger.info("Saved visual ColQwen val predictions to %s", prediction_path)
     logger.info("Saved visual ColQwen val metrics to %s", metrics_path)
     logger.info("Visual ColQwen val metrics: %s", metrics)
+
+
+def eval_visual_colqwen_adaptive_coarse_retrieval_pipeline(cfg: Any) -> None:
+    """Run adaptive coarse BM25 routing + ColQwen subset reranking on val."""
+    logger = _build_logger(cfg, "eval_visual_colqwen_adaptive_coarse_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_colqwen_adaptive_coarse_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_colqwen_adaptive_coarse_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_colqwen_adaptive_coarse_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual ColQwen adaptive coarse val predictions to %s", prediction_path)
+    logger.info("Saved visual ColQwen adaptive coarse val metrics to %s", metrics_path)
+    logger.info("Visual ColQwen adaptive coarse val metrics: %s", metrics)
+
+
+def eval_ocr_page_coarse_chunk_pipeline(cfg: Any) -> None:
+    """Run OCR page-level coarse routing + chunk rerank on val."""
+    logger = _build_logger(cfg, "eval_ocr_page_coarse_chunk_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_page_coarse_chunk_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_page_coarse_chunk_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_page_coarse_chunk_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR page coarse chunk val predictions to %s", prediction_path)
+    logger.info("Saved OCR page coarse chunk val metrics to %s", metrics_path)
+    logger.info("OCR page coarse chunk val metrics: %s", metrics)
+
+
+def eval_ocr_page_bm25_bge_rerank_pipeline(cfg: Any) -> None:
+    """Run OCR page-level BM25 -> BGE-M3 -> reranker on val."""
+    logger = _build_logger(cfg, "eval_ocr_page_bm25_bge_rerank_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_ocr_page_bm25_bge_rerank_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "ocr_page_bm25_bge_rerank_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "ocr_page_bm25_bge_rerank_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved OCR page BM25 BGE rerank val predictions to %s", prediction_path)
+    logger.info("Saved OCR page BM25 BGE rerank val metrics to %s", metrics_path)
+    logger.info("OCR page BM25 BGE rerank val metrics: %s", metrics)
 
 
 def infer_visual_test_pipeline(cfg: Any) -> None:

@@ -58,6 +58,37 @@ class ColQwenRetriever:
         scores = self._score_query_against_document(query_embedding, self.index[doc_id]["embeddings"])
         return topk_from_scores(self.index[doc_id]["page_ids"], scores, topk)
 
+    def retrieve_subset(
+        self,
+        question: str,
+        doc_id: str,
+        candidate_page_ids: list[int],
+        topk: int | None = None,
+    ) -> dict[str, list]:
+        """Retrieve and rank only a routed subset of pages from an already indexed document."""
+        if doc_id not in self.index:
+            return {"page_ids": [], "scores": [], "ranks": []}
+        candidate_page_set = {int(page_id) for page_id in candidate_page_ids}
+        if not candidate_page_set:
+            return {"page_ids": [], "scores": [], "ranks": []}
+
+        page_embeddings = self.index[doc_id]["embeddings"]
+        doc_page_ids = self.index[doc_id]["page_ids"]
+        filtered_page_ids: list[int] = []
+        filtered_embeddings: list[Any] = []
+        for page_id, embedding in zip(doc_page_ids, page_embeddings):
+            if int(page_id) in candidate_page_set:
+                filtered_page_ids.append(int(page_id))
+                filtered_embeddings.append(embedding)
+        if not filtered_page_ids:
+            return {"page_ids": [], "scores": [], "ranks": []}
+
+        self._ensure_engine_runtime()
+        query_embedding = self._encode_query_embedding(question)
+        scores = self._score_query_against_document(query_embedding, filtered_embeddings)
+        effective_topk = len(filtered_page_ids) if topk is None else min(int(topk), len(filtered_page_ids))
+        return topk_from_scores(filtered_page_ids, scores, effective_topk)
+
     def _ensure_engine_runtime(self) -> None:
         """Lazily load the offline ColQwen model and processor from the local directory."""
         if self._engine_loaded:

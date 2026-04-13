@@ -11,13 +11,16 @@ from src.utils.logger import get_logger
 class OCRBGEReranker:
     """Rerank OCR page candidates within one document using a local BGE reranker."""
 
-    def __init__(self, cfg: Any) -> None:
+    def __init__(self, cfg: Any, config_attr: str = "ocr_retrieval") -> None:
         self.cfg = cfg
-        self.model_name = str(cfg.ocr_retrieval.reranker_model_name)
-        self.device = str(cfg.ocr_retrieval.device)
-        self.local_files_only = bool(cfg.ocr_retrieval.local_files_only)
-        self.batch_size = int(cfg.ocr_retrieval.rerank_batch_size)
-        self.max_length = int(cfg.ocr_retrieval.rerank_max_length)
+        self.config_attr = str(config_attr)
+        config = getattr(cfg, self.config_attr)
+        model_name = getattr(config, "model_name", None) or getattr(config, "reranker_model_name", None)
+        self.model_name = str(model_name)
+        self.device = str(getattr(config, "device"))
+        self.local_files_only = bool(getattr(config, "local_files_only"))
+        self.batch_size = int(getattr(config, "batch_size", getattr(config, "rerank_batch_size", 8)))
+        self.max_length = int(getattr(config, "max_length", getattr(config, "rerank_max_length", 512)))
         self.logger = get_logger("ocr_bge_reranker")
         self._tokenizer = None
         self._model = None
