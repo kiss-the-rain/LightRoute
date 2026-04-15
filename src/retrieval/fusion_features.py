@@ -96,6 +96,31 @@ ROUTE_AGREEMENT_ORDER = [
 
 FEATURE_ORDER_MLP_OCRQ_CHUNKPLUS = FEATURE_ORDER_ABLATE_OCRQ + QUESTION_TYPE_ORDER + CHUNK_AWARE_ORDER + ROUTE_AGREEMENT_ORDER
 
+GATING_FEATURE_ORDER = [
+    "query_length",
+    "contains_digits",
+    "contains_date_like",
+    "contains_numeric_cue",
+    "contains_visual_cue",
+    "contains_id_cue",
+    "ocr_token_count_mean",
+    "ocr_non_empty_ratio",
+    "ocr_valid_char_ratio_mean",
+    "digit_density_mean",
+    "text_density_mean",
+    "ocr_reliability_mean",
+    "visual_top_gap",
+    "ocr_top_gap",
+    "visual_top_prominence",
+    "ocr_top_prominence",
+    "visual_score_std",
+    "ocr_score_std",
+    "max_visual_score",
+    "max_ocr_score",
+    "best_visual_rank_reciprocal",
+    "best_ocr_rank_reciprocal",
+]
+
 
 def build_candidate_features(
     sample: dict[str, Any],
@@ -788,6 +813,103 @@ def build_candidate_features_visual_colqwen_ocr_chunk(
         row["ocr_page_coarse_num_pages_before"] = float(ocr_page_coarse_meta.get("num_pages_before", 0))
         row["ocr_page_coarse_num_pages_after"] = float(ocr_page_coarse_meta.get("num_pages_after", 0))
     return rows
+
+
+def refresh_candidate_feature_vectors(candidate_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rebuild feature vectors after mutating score-like fields in candidate rows."""
+    refreshed_rows: list[dict[str, Any]] = []
+    for row in candidate_rows:
+        feature_order = list(row.get("feature_names", FEATURE_ORDER_ABLATE_OCRQ))
+        row["feature_names"] = feature_order
+        row["feature_vector"] = _vector_from_feature_order(row, feature_order)
+        refreshed_rows.append(row)
+    return refreshed_rows
+
+
+def build_dynamic_gating_feature_vector(
+    sample: dict[str, Any],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a compact sample-level feature vector for rule-based or learned gating."""
+    question = str(sample.get("question", "")).lower()
+    question_length = float(candidate_rows[0].get("question_token_count", candidate_rows[0].get("question_length", 0.0))) if candidate_rows else 0.0
+    contains_digits = float(bool(any(ch.isdigit() for ch in question))) if question else 0.0
+    contains_date_like = float(bool(candidate_rows and candidate_rows[0].get("contains_year", 0.0))) or float(
+        bool(any(token in question for token in ["date", "day", "month", "year", "when"]))
+    )
+    contains_numeric_cue = float(bool(candidate_rows and candidate_rows[0].get("contains_amount_cue", 0.0))) or float(
+        bool(any(token in question for token in ["amount", "invoice", "id", "reference", "total", "price", "cost"]))
+    )
+    contains_visual_cue = float(bool(candidate_rows and candidate_rows[0].get("contains_table_cue", 0.0))) or float(
+        bool(any(token in question for token in ["chart", "figure", "trend", "curve", "layout", "region", "table", "graph"]))
+    )
+    contains_id_cue = float(bool(any(token in question for token in ["id", "reference", "invoice", "account", "receipt"])))
+
+    ocr_token_counts = [float(row.get("ocr_token_count", 0.0)) for row in candidate_rows]
+    empty_like = [float(row.get("ocr_empty_like_flag", 0.0)) for row in candidate_rows]
+    non_alnum = [float(row.get("ocr_non_alnum_ratio", 0.0)) for row in candidate_rows]
+    digit_ratio = [float(row.get("ocr_digit_ratio", 0.0)) for row in candidate_rows]
+    reliabilities = [float(row.get("ocr_reliability", 0.0)) for row in candidate_rows]
+    visual_scores = [float(row.get("visual_score", 0.0)) for row in candidate_rows]
+    ocr_scores = [float(row.get("ocr_score", 0.0)) for row in candidate_rows]
+    visual_ranks = [int(row.get("visual_rank", 0) or 0) for row in candidate_rows if int(row.get("visual_rank", 0) or 0) > 0]
+    ocr_ranks = [int(row.get("ocr_rank", 0) or 0) for row in candidate_rows if int(row.get("ocr_rank", 0) or 0) > 0]
+
+    def _safe_mean(values: list[float]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    def _safe_std(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        mean_value = _safe_mean(values)
+        variance = sum((value - mean_value) ** 2 for value in values) / max(len(values), 1)
+        return float(math.sqrt(max(variance, 0.0)))
+
+    def _top_gap(values: list[float]) -> float:
+        sorted_values = sorted((float(value) for value in values), reverse=True)
+        if not sorted_values:
+            return 0.0
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+        return float(sorted_values[0] - sorted_values[1])
+
+    def _prominence(values: list[float]) -> float:
+        sorted_values = sorted((float(value) for value in values), reverse=True)
+        if not sorted_values:
+            return 0.0
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+        return float(sorted_values[0] - _safe_mean(sorted_values[1:]))
+
+    feature_map = {
+        "query_length": question_length,
+        "contains_digits": contains_digits,
+        "contains_date_like": contains_date_like,
+        "contains_numeric_cue": contains_numeric_cue,
+        "contains_visual_cue": contains_visual_cue,
+        "contains_id_cue": contains_id_cue,
+        "ocr_token_count_mean": _safe_mean(ocr_token_counts),
+        "ocr_non_empty_ratio": 1.0 - _safe_mean(empty_like),
+        "ocr_valid_char_ratio_mean": 1.0 - min(max(_safe_mean(non_alnum), 0.0), 1.0),
+        "digit_density_mean": _safe_mean(digit_ratio),
+        "text_density_mean": min(max(_safe_mean(ocr_token_counts) / 120.0, 0.0), 1.0),
+        "ocr_reliability_mean": _safe_mean(reliabilities),
+        "visual_top_gap": _top_gap(visual_scores),
+        "ocr_top_gap": _top_gap(ocr_scores),
+        "visual_top_prominence": _prominence(visual_scores),
+        "ocr_top_prominence": _prominence(ocr_scores),
+        "visual_score_std": _safe_std(visual_scores),
+        "ocr_score_std": _safe_std(ocr_scores),
+        "max_visual_score": max(visual_scores) if visual_scores else 0.0,
+        "max_ocr_score": max(ocr_scores) if ocr_scores else 0.0,
+        "best_visual_rank_reciprocal": 1.0 / min(visual_ranks) if visual_ranks else 0.0,
+        "best_ocr_rank_reciprocal": 1.0 / min(ocr_ranks) if ocr_ranks else 0.0,
+    }
+    return {
+        "feature_names": list(GATING_FEATURE_ORDER),
+        "feature_map": feature_map,
+        "feature_vector": [_scaled_feature_value(name, feature_map.get(name, 0.0)) for name in GATING_FEATURE_ORDER],
+    }
 
 
 def _build_candidate_features_ablation(

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from tqdm import tqdm
 
 from src.evaluation.retrieval_metrics import evaluate_retrieval
@@ -27,6 +30,7 @@ from src.inference.infer_retrieval import (
     summarize_adaptive_coarse_stats,
 )
 from src.models.adaptive_fusion import AdaptiveFusion, AdaptiveFusionV2
+from src.models.gating_mlp import GateNet
 from src.models.question_encoder import QuestionEncoder
 from src.retrieval.colpali_retriever import ColPaliRetriever
 from src.retrieval.colqwen_retriever import ColQwenRetriever
@@ -39,6 +43,7 @@ from src.retrieval.ocr_chunker import OCRChunkBuilder
 from src.retrieval.ocr_hybrid_retriever import OCRHybridRetriever
 from src.retrieval.ocr_nv_retriever import OCRNVChunkRetriever
 from src.retrieval.fusion_features import (
+    build_dynamic_gating_feature_vector,
     build_candidate_features,
     build_candidate_features_ablate_lex,
     build_candidate_features_ablate_mlp_lex,
@@ -50,6 +55,14 @@ from src.retrieval.fusion_features import (
     build_candidate_features_ablate_ocrq,
     build_candidate_features_ablate_q,
     build_candidate_features_v2,
+    refresh_candidate_feature_vectors,
+)
+from src.retrieval.dynamic_weighting import (
+    apply_branch_reweighting,
+    calibrate_route_scores,
+    compute_rule_based_weights,
+    derive_gate_targets,
+    summarize_weight_debug,
 )
 from src.training.trainer import Trainer
 from src.utils.io_utils import load_jsonl, load_pickle, save_json, save_jsonl, save_pickle
@@ -769,3 +782,521 @@ def _dump_feature_debug(cfg: Any, variant_name: str, batches: list[dict[str, Any
         return
     debug_path = Path(cfg.paths.output_dir) / "debug" / f"fusion_feature_debug_{variant_name}.jsonl"
     save_jsonl(debug_rows, debug_path)
+
+
+def train_adaptive_fusion_dynamic_rules(cfg: Any) -> dict[str, Any]:
+    """Train a new rule-based dynamic weighting family on top of the frozen dual-branch retrievers."""
+    return _train_dynamic_fusion_family(
+        cfg=cfg,
+        stage_name="dynamic_rules",
+        logger_name="train_adaptive_fusion_dynamic_rules",
+        checkpoint_subdir="adaptive_fusion_dynamic_rules",
+        prediction_filename="adaptive_fusion_dynamic_rules_val_predictions.jsonl",
+        metric_filename="adaptive_fusion_dynamic_rules_val_metrics.json",
+        train_metric_filename=f"{cfg.experiment.name}_train_adaptive_fusion_dynamic_rules_metrics.json",
+    )
+
+
+def train_adaptive_fusion_learned_gating(cfg: Any) -> dict[str, Any]:
+    """Train a learned global gate plus the existing lightweight MLP scorer."""
+    return _train_dynamic_fusion_family(
+        cfg=cfg,
+        stage_name="learned_gating",
+        logger_name="train_adaptive_fusion_learned_gating",
+        checkpoint_subdir="adaptive_fusion_learned_gating",
+        prediction_filename="adaptive_fusion_learned_gating_val_predictions.jsonl",
+        metric_filename="adaptive_fusion_learned_gating_val_metrics.json",
+        train_metric_filename=f"{cfg.experiment.name}_train_adaptive_fusion_learned_gating_metrics.json",
+    )
+
+
+def train_adaptive_fusion_gating_calibrated(cfg: Any) -> dict[str, Any]:
+    """Train the calibrated gating family with optional pairwise hard-negative loss."""
+    calibration_name = str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw"))
+    loss_type = str(getattr(getattr(cfg, "dynamic_fusion", {}), "loss_type", "pointwise_bce"))
+    loss_suffix = "margin" if loss_type == "pairwise_margin" else "pointwise"
+    stage_suffix = f"{calibration_name}_{loss_suffix}"
+    return _train_dynamic_fusion_family(
+        cfg=cfg,
+        stage_name="gating_calibrated",
+        logger_name="train_adaptive_fusion_gating_calibrated",
+        checkpoint_subdir=f"adaptive_fusion_gating_calibrated_{stage_suffix}",
+        prediction_filename=f"adaptive_fusion_gating_calibrated_{stage_suffix}_val_predictions.jsonl",
+        metric_filename=f"adaptive_fusion_gating_calibrated_{stage_suffix}_val_metrics.json",
+        train_metric_filename=f"{cfg.experiment.name}_train_adaptive_fusion_gating_calibrated_{stage_suffix}_metrics.json",
+    )
+
+
+def _train_dynamic_fusion_family(
+    cfg: Any,
+    stage_name: str,
+    logger_name: str,
+    checkpoint_subdir: str,
+    prediction_filename: str,
+    metric_filename: str,
+    train_metric_filename: str,
+) -> dict[str, Any]:
+    """Shared staged training loop for dynamic OCR/visual weighting experiments."""
+    logger = get_logger(logger_name, log_file=Path(cfg.paths.log_dir) / f"{cfg.experiment.name}_{checkpoint_subdir}.log")
+    logger.info("Starting staged dynamic fusion training. stage=%s", stage_name)
+    logger.info(
+        "dynamic settings: rule_variant=%s calibration=%s loss_type=%s gate_hidden_dim=%s cache=%s",
+        str(getattr(getattr(cfg, "dynamic_fusion", {}), "rule_variant", "combined")),
+        str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw")),
+        str(getattr(getattr(cfg, "dynamic_fusion", {}), "loss_type", "pointwise_bce")),
+        int(getattr(getattr(cfg, "dynamic_fusion", {}), "gate_hidden_dim", 16)),
+        bool(getattr(getattr(cfg, "dynamic_fusion", {}), "enable_feature_cache", True)),
+    )
+
+    logger.info("Loading processed train split from %s", cfg.dataset.processed_files["train"])
+    train_dataset = load_jsonl(cfg.dataset.processed_files["train"]) if Path(cfg.dataset.processed_files["train"]).exists() else []
+    logger.info("Loading processed val split from %s", cfg.dataset.processed_files["val"])
+    val_dataset = load_jsonl(cfg.dataset.processed_files["val"]) if Path(cfg.dataset.processed_files["val"]).exists() else []
+
+    max_train_samples = int(getattr(cfg.training, "max_train_samples", 0) or 0)
+    max_val_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    if max_train_samples > 0:
+        train_dataset = train_dataset[:max_train_samples]
+        logger.info("Using train subset for smoke test: %d samples", len(train_dataset))
+    if max_val_samples > 0:
+        val_dataset = val_dataset[:max_val_samples]
+        logger.info("Using val subset for smoke test: %d samples", len(val_dataset))
+
+    if not train_dataset or not val_dataset:
+        metrics = {"status": "skipped", "reason": "train/val processed datasets are missing or empty"}
+        save_json(metrics, Path(cfg.paths.metric_dir) / train_metric_filename)
+        return metrics
+
+    checkpoint_dir = Path(cfg.paths.checkpoint_dir) / checkpoint_subdir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    base_cache_train = _load_or_build_dynamic_stage_inputs(cfg, train_dataset, stage_name, split_name="train", logger=logger)
+    base_cache_val = _load_or_build_dynamic_stage_inputs(cfg, val_dataset, stage_name, split_name="val", logger=logger)
+    train_batches = base_cache_train["batches"]
+    val_batches = base_cache_val["batches"]
+    train_batch_stats = dict(base_cache_train["stats"])
+    val_batch_stats = dict(base_cache_val["stats"])
+    if not train_batches or not val_batches:
+        metrics = {
+            "status": "skipped",
+            "reason": "dynamic fusion stage inputs are empty",
+            "train_batch_stats": train_batch_stats,
+            "val_batch_stats": val_batch_stats,
+        }
+        save_json(metrics, Path(cfg.paths.metric_dir) / train_metric_filename)
+        return metrics
+
+    feature_dim = len(train_batches[0]["candidate_rows"][0].get("feature_vector", []))
+    scorer = AdaptiveFusionV2(
+        feature_dim=feature_dim,
+        hidden_dim=int(cfg.fusion.hidden_dim),
+        dropout=float(cfg.fusion.dropout),
+    )
+    gate_model = None
+    if stage_name in {"learned_gating", "gating_calibrated"}:
+        gate_dim = len(train_batches[0].get("gating_feature_vector", []))
+        gate_model = GateNet(
+            input_dim=gate_dim,
+            hidden_dim=int(getattr(getattr(cfg, "dynamic_fusion", {}), "gate_hidden_dim", 16)),
+            min_weight=float(getattr(getattr(cfg, "dynamic_fusion", {}), "min_weight", 0.2)),
+            max_weight=float(getattr(getattr(cfg, "dynamic_fusion", {}), "max_weight", 0.8)),
+        )
+
+    best_mrr = float("-inf")
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    patience = int(cfg.training.early_stopping_patience)
+    total_epochs = int(cfg.training.epochs)
+    best_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_best.pkl"
+    last_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_last.pkl"
+
+    epoch_iterator = tqdm(range(total_epochs), desc=f"{stage_name} epochs", unit="epoch")
+    for epoch in epoch_iterator:
+        train_epoch_metrics = _run_dynamic_train_epoch(cfg, scorer, gate_model, train_batches, stage_name, epoch)
+        val_predictions, val_retrieval_metrics, val_dynamic_metrics = _run_dynamic_eval_from_batches(
+            cfg,
+            scorer,
+            gate_model,
+            val_batches,
+            stage_name=stage_name,
+            desc=f"{stage_name} val",
+        )
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            **train_epoch_metrics,
+            "val_mrr": float(val_retrieval_metrics.get("MRR", 0.0)),
+            "val_recall@1": float(val_retrieval_metrics.get("Recall@1", 0.0)),
+            "val_loss_proxy": float(train_epoch_metrics.get("train_loss", 0.0)),
+            **{f"val_{key}": value for key, value in val_dynamic_metrics.items()},
+        }
+        history.append(epoch_metrics)
+        self_checkpoint = {
+            "epoch": epoch + 1,
+            "metric": float(val_retrieval_metrics.get("MRR", 0.0)),
+            "stage_name": stage_name,
+            "model_state": scorer.state_dict(),
+            "gate_state": gate_model.state_dict() if gate_model is not None else None,
+        }
+        save_pickle(self_checkpoint, last_checkpoint_path)
+        if float(val_retrieval_metrics.get("MRR", 0.0)) > best_mrr:
+            best_mrr = float(val_retrieval_metrics.get("MRR", 0.0))
+            best_epoch = epoch + 1
+            save_pickle(self_checkpoint, best_checkpoint_path)
+            save_jsonl(val_predictions, Path(cfg.paths.prediction_dir) / prediction_filename)
+            save_json(
+                {**val_retrieval_metrics, **val_dynamic_metrics},
+                Path(cfg.paths.metric_dir) / metric_filename,
+            )
+        logger.info("Epoch %d staged dynamic metrics: %s", epoch + 1, epoch_metrics)
+        epoch_iterator.set_postfix(
+            train_loss=f"{float(train_epoch_metrics.get('train_loss', 0.0)):.4f}",
+            val_mrr=f"{float(val_retrieval_metrics.get('MRR', 0.0)):.4f}",
+        )
+        if epoch + 1 - best_epoch >= patience:
+            logger.info("Early stopping triggered at epoch %d", epoch + 1)
+            break
+
+    best_checkpoint = load_pickle(best_checkpoint_path)
+    scorer.load_state_dict(best_checkpoint["model_state"])
+    if gate_model is not None and best_checkpoint.get("gate_state") is not None:
+        gate_model.load_state_dict(best_checkpoint["gate_state"])
+    val_predictions, retrieval_metrics, val_dynamic_metrics = _run_dynamic_eval_from_batches(
+        cfg,
+        scorer,
+        gate_model,
+        val_batches,
+        stage_name=stage_name,
+        desc=f"{stage_name} best-val",
+    )
+    save_jsonl(val_predictions, Path(cfg.paths.prediction_dir) / prediction_filename)
+    save_json({**retrieval_metrics, **val_dynamic_metrics}, Path(cfg.paths.metric_dir) / metric_filename)
+    metrics = {
+        "best_val_mrr": best_mrr,
+        "best_epoch": best_epoch,
+        "history": history,
+        "checkpoint_path": str(best_checkpoint_path),
+        "train_batch_stats": train_batch_stats,
+        "val_batch_stats": val_batch_stats,
+        "val_retrieval_metrics": retrieval_metrics,
+        "val_dynamic_metrics": val_dynamic_metrics,
+    }
+    save_json(metrics, Path(cfg.paths.metric_dir) / train_metric_filename)
+    logger.info("%s training completed: %s", checkpoint_subdir, metrics)
+    return metrics
+
+
+def _load_or_build_dynamic_stage_inputs(
+    cfg: Any,
+    dataset: list[dict[str, Any]],
+    stage_name: str,
+    split_name: str,
+    logger: Any,
+) -> dict[str, Any]:
+    """Load or build cached dynamic-fusion base signals and stage-prepared inputs."""
+    dynamic_cfg = getattr(cfg, "dynamic_fusion", {})
+    cache_enabled = bool(getattr(dynamic_cfg, "enable_feature_cache", True))
+    signature = _dynamic_config_signature(cfg, stage_name)
+    base_cache_path = Path(cfg.paths.cache_dir) / f"{cfg.experiment.name}_{stage_name}_{split_name}_layer1_{signature}.pkl"
+    prepared_cache_path = Path(cfg.paths.cache_dir) / f"{cfg.experiment.name}_{stage_name}_{split_name}_layer2_{signature}.pkl"
+    if cache_enabled and prepared_cache_path.exists():
+        logger.info("Loaded dynamic stage inputs from cache: %s", prepared_cache_path)
+        payload = load_pickle(prepared_cache_path)
+        payload["stats"]["feature_cache_hits"] = int(payload["stats"].get("feature_cache_hits", 0)) + 1
+        return payload
+
+    if cache_enabled and base_cache_path.exists():
+        base_payload = load_pickle(base_cache_path)
+        base_payload["stats"]["base_cache_hits"] = int(base_payload["stats"].get("base_cache_hits", 0)) + 1
+    else:
+        base_batches, base_stats = _build_dynamic_base_batches(cfg, dataset, logger)
+        base_payload = {"batches": base_batches, "stats": {**base_stats, "base_cache_hits": 0, "base_cache_misses": 1}}
+        if cache_enabled:
+            save_pickle(base_payload, base_cache_path)
+
+    prepared_batches = [_prepare_stage_input_batch(batch, cfg, stage_name) for batch in base_payload["batches"]]
+    prepared_payload = {
+        "batches": prepared_batches,
+        "stats": {
+            **base_payload["stats"],
+            "feature_cache_hits": 0,
+            "feature_cache_misses": 1,
+            "stage_name": stage_name,
+        },
+    }
+    if cache_enabled:
+        save_pickle(prepared_payload, prepared_cache_path)
+    return prepared_payload
+
+
+def _dynamic_config_signature(cfg: Any, stage_name: str) -> str:
+    dynamic_cfg = getattr(cfg, "dynamic_fusion", {})
+    payload = {
+        "stage_name": stage_name,
+        "rule_variant": getattr(dynamic_cfg, "rule_variant", "combined"),
+        "calibration_option": getattr(dynamic_cfg, "calibration_option", "raw"),
+        "loss_type": getattr(dynamic_cfg, "loss_type", "pointwise_bce"),
+        "hard_negative_k": getattr(dynamic_cfg, "pairwise_hard_negative_k", 3),
+        "min_weight": getattr(dynamic_cfg, "min_weight", 0.2),
+        "max_weight": getattr(dynamic_cfg, "max_weight", 0.8),
+        "query_bias_scale": getattr(dynamic_cfg, "query_bias_scale", 0.18),
+        "page_correction_scale": getattr(dynamic_cfg, "page_correction_scale", 0.08),
+        "confidence_correction_scale": getattr(dynamic_cfg, "confidence_correction_scale", 0.08),
+    }
+    digest = hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:10]
+
+
+def _build_dynamic_base_batches(cfg: Any, dataset: list[dict[str, Any]], logger: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build base candidate rows for the new dynamic-fusion family."""
+    question_encoder = QuestionEncoder()
+    bm25_text_cache: dict[str, list[str]] = {}
+    visual_coarse_text_cache: dict[str, list[str]] = {}
+    bm25_retriever_cache: dict[str, Any] = {}
+    coarse_bm25_retriever_cache: dict[str, Any] = {}
+    ocr_coarse_text_cache: dict[str, list[str]] = {}
+    ocr_coarse_retriever_cache: dict[str, Any] = {}
+    ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_page_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_indexed_docs: set[str] = set()
+    visual_retriever = ColQwenRetriever(cfg)
+    visual_indexed_docs: set[str] = set()
+    ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
+    return _build_training_batches(
+        cfg,
+        dataset,
+        question_encoder,
+        logger,
+        bm25_text_cache,
+        bm25_retriever_cache,
+        visual_retriever,
+        visual_indexed_docs,
+        ocr_quality_cache,
+        feature_builder=build_candidate_features_visual_colqwen_ocr_chunk,
+        ocr_backend="ocr_page_bm25_bge_rerank",
+        visual_backend="colqwen",
+        ocr_bge_retriever=None,
+        ocr_bge_reranker=None,
+        ocr_page_retriever=ocr_page_retriever,
+        ocr_page_reranker=ocr_page_reranker,
+        ocr_bge_indexed_docs=ocr_indexed_docs,
+        chunk_builder=None,
+        ocr_chunk_retriever=None,
+        ocr_chunk_reranker=None,
+        ocr_chunk_indexed_docs=set(),
+        ocr_chunk_cache={},
+        ocr_hybrid_retriever=None,
+        ocr_nv_chunk_retriever=None,
+        ocr_nv_chunk_indexed_docs=set(),
+        coarse_bm25_retriever_cache=coarse_bm25_retriever_cache,
+        use_adaptive_coarse_visual=True,
+        use_ocr_page_coarse=True,
+        require_positive_candidate=True,
+        visual_coarse_text_cache=visual_coarse_text_cache,
+        ocr_coarse_text_cache=ocr_coarse_text_cache,
+        ocr_coarse_retriever_cache=ocr_coarse_retriever_cache,
+    )
+
+
+def _prepare_stage_input_batch(batch: dict[str, Any], cfg: Any, stage_name: str) -> dict[str, Any]:
+    """Assemble cached base signals and sample-level gating inputs for a staged experiment."""
+    stage_batch = {
+        "qid": batch["qid"],
+        "doc_id": batch["doc_id"],
+        "question": batch.get("question", ""),
+        "evidence_pages": list(batch.get("evidence_pages", [])),
+        "labels": list(batch.get("labels", [])),
+        "candidate_rows": batch.get("candidate_rows", []),
+    }
+    gating_features = build_dynamic_gating_feature_vector({"question": batch.get("question", "")}, stage_batch["candidate_rows"])
+    stage_batch["gating_feature_names"] = list(gating_features["feature_names"])
+    stage_batch["gating_feature_vector"] = list(gating_features["feature_vector"])
+    stage_batch["gating_feature_map"] = dict(gating_features["feature_map"])
+    if stage_name == "gating_calibrated":
+        calibrated_rows, calibration_stats = calibrate_route_scores(
+            stage_batch["candidate_rows"],
+            option=str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw")),
+        )
+        stage_batch["candidate_rows"] = refresh_candidate_feature_vectors(calibrated_rows)
+        stage_batch["calibration_stats"] = calibration_stats
+    else:
+        stage_batch["calibration_stats"] = {}
+    return stage_batch
+
+
+def _run_dynamic_train_epoch(
+    cfg: Any,
+    scorer: AdaptiveFusionV2,
+    gate_model: GateNet | None,
+    train_batches: list[dict[str, Any]],
+    stage_name: str,
+    epoch: int,
+) -> dict[str, Any]:
+    dynamic_cfg = getattr(cfg, "dynamic_fusion", {})
+    learning_rate = float(cfg.training.learning_rate)
+    gate_learning_rate = float(getattr(dynamic_cfg, "gate_learning_rate", learning_rate))
+    weight_decay = float(cfg.training.weight_decay)
+    loss_type = str(getattr(dynamic_cfg, "loss_type", "pointwise_bce"))
+    margin = float(getattr(dynamic_cfg, "pairwise_margin", 1.0))
+    hard_negative_k = int(getattr(dynamic_cfg, "pairwise_hard_negative_k", 3))
+    total_loss = 0.0
+    total_gate_loss = 0.0
+    total_batches = 0
+    total_pairs = 0
+    weight_debug: list[dict[str, Any]] = []
+    iterator = tqdm(train_batches, desc=f"{stage_name} train epoch {epoch + 1}", unit="sample", leave=False)
+    for batch in iterator:
+        prepared = _prepare_dynamic_batch_for_scoring(cfg, batch, stage_name, gate_model, train_gate=True, gate_learning_rate=gate_learning_rate, weight_decay=weight_decay)
+        features = np.asarray([list(row["feature_vector"]) for row in prepared["weighted_rows"]], dtype=float)
+        labels = np.asarray(batch["labels"], dtype=float)
+        if loss_type == "pairwise_margin":
+            loss, num_pairs = scorer.train_step_pairwise(
+                features,
+                labels,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                margin=margin,
+                hard_negative_k=hard_negative_k,
+            )
+            total_pairs += int(num_pairs)
+        else:
+            loss = scorer.train_step(
+                features,
+                labels,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+            )
+        total_loss += float(loss)
+        total_gate_loss += float(prepared.get("gate_loss", 0.0))
+        total_batches += 1
+        weight_debug.append(prepared["weight_debug"])
+        iterator.set_postfix(
+            loss=f"{float(total_loss / max(total_batches, 1)):.4f}",
+            alpha_v=f"{float(prepared['weight_debug'].get('alpha_v', 0.5)):.2f}",
+            alpha_o=f"{float(prepared['weight_debug'].get('alpha_o', 0.5)):.2f}",
+        )
+    summary = summarize_weight_debug(weight_debug)
+    summary.update(
+        {
+            "train_loss": total_loss / max(total_batches, 1),
+            "train_gate_loss": total_gate_loss / max(total_batches, 1),
+            "loss_type": loss_type,
+            "num_positive_samples": sum(1 for batch in train_batches if any(label > 0 for label in batch.get("labels", []))),
+            "num_negative_pairs": total_pairs,
+        }
+    )
+    return summary
+
+
+def _prepare_dynamic_batch_for_scoring(
+    cfg: Any,
+    batch: dict[str, Any],
+    stage_name: str,
+    gate_model: GateNet | None,
+    train_gate: bool,
+    gate_learning_rate: float,
+    weight_decay: float,
+) -> dict[str, Any]:
+    dynamic_cfg = getattr(cfg, "dynamic_fusion", {})
+    candidate_rows = batch.get("candidate_rows", [])
+    alpha_v = 0.5
+    alpha_o = 0.5
+    weight_debug: dict[str, Any] = {}
+    gate_loss = 0.0
+    if stage_name == "dynamic_rules":
+        alpha_v, alpha_o, debug_meta = compute_rule_based_weights(
+            candidate_rows,
+            {"question": batch.get("question", "")},
+            variant=str(getattr(dynamic_cfg, "rule_variant", "combined")),
+            cfg=cfg,
+        )
+        weight_debug = {"alpha_v": alpha_v, "alpha_o": alpha_o, **debug_meta}
+    else:
+        assert gate_model is not None
+        target_weights = derive_gate_targets(
+            candidate_rows,
+            batch.get("evidence_pages", []),
+            min_weight=float(getattr(dynamic_cfg, "min_weight", 0.2)),
+            max_weight=float(getattr(dynamic_cfg, "max_weight", 0.8)),
+        )
+        if train_gate:
+            gate_loss = gate_model.train_step(
+                batch.get("gating_feature_vector", []),
+                target_weights=target_weights,
+                learning_rate=gate_learning_rate,
+                weight_decay=float(getattr(dynamic_cfg, "gate_weight_decay", weight_decay)),
+            )
+        alpha_v, alpha_o = gate_model.predict_weights(batch.get("gating_feature_vector", []))
+        buckets = compute_rule_based_weights(
+            candidate_rows,
+            {"question": batch.get("question", "")},
+            variant="combined",
+            cfg=cfg,
+        )[2]
+        weight_debug = {
+            "alpha_v": alpha_v,
+            "alpha_o": alpha_o,
+            "target_alpha_v": float(target_weights[0]),
+            "target_alpha_o": float(target_weights[1]),
+            **{key: value for key, value in buckets.items() if key in {"query_bucket", "page_bucket"}},
+        }
+    weighted_rows = apply_branch_reweighting(candidate_rows, alpha_v=alpha_v, alpha_o=alpha_o)
+    weighted_rows = refresh_candidate_feature_vectors(weighted_rows)
+    return {
+        "weighted_rows": weighted_rows,
+        "weight_debug": weight_debug,
+        "gate_loss": gate_loss,
+    }
+
+
+def _run_dynamic_eval_from_batches(
+    cfg: Any,
+    scorer: AdaptiveFusionV2,
+    gate_model: GateNet | None,
+    val_batches: list[dict[str, Any]],
+    stage_name: str,
+    desc: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    predictions: list[dict[str, Any]] = []
+    weight_debug: list[dict[str, Any]] = []
+    calibration_debug: dict[str, list[dict[str, float]]] = {"visual_pre": [], "visual_post": [], "ocr_pre": [], "ocr_post": []}
+    for batch in tqdm(val_batches, desc=desc, unit="sample", leave=False):
+        prepared = _prepare_dynamic_batch_for_scoring(
+            cfg,
+            batch,
+            stage_name=stage_name,
+            gate_model=gate_model,
+            train_gate=False,
+            gate_learning_rate=0.0,
+            weight_decay=0.0,
+        )
+        weight_debug.append(prepared["weight_debug"])
+        if batch.get("calibration_stats"):
+            for key in calibration_debug:
+                calibration_debug[key].append(batch["calibration_stats"].get(key, {}))
+        ranked = scorer.rank_candidates(prepared["weighted_rows"])
+        predictions.append(
+            {
+                "qid": batch["qid"],
+                "doc_id": batch["doc_id"],
+                "question": batch.get("question", ""),
+                "evidence_pages": [int(page) for page in batch.get("evidence_pages", [])],
+                "pred_page_ids": ranked["page_ids"][: int(cfg.retrieval.topk)],
+                "pred_scores": ranked["scores"][: int(cfg.retrieval.topk)],
+                "topk": int(cfg.retrieval.topk),
+            }
+        )
+    labeled_predictions = [item for item in predictions if item.get("evidence_pages")]
+    retrieval_metrics = evaluate_retrieval(labeled_predictions, list(cfg.retrieval.k_values)) if labeled_predictions else {}
+    retrieval_metrics["num_samples"] = len(predictions)
+    dynamic_metrics = summarize_weight_debug(weight_debug)
+    dynamic_metrics["rule_variant_name"] = str(getattr(getattr(cfg, "dynamic_fusion", {}), "rule_variant", "combined"))
+    if any(calibration_debug[key] for key in calibration_debug):
+        dynamic_metrics["calibration_debug"] = {
+            key: {
+                "mean": float(np.mean([item.get("mean", 0.0) for item in values])) if values else 0.0,
+                "std": float(np.mean([item.get("std", 0.0) for item in values])) if values else 0.0,
+                "min": float(np.mean([item.get("min", 0.0) for item in values])) if values else 0.0,
+                "max": float(np.mean([item.get("max", 0.0) for item in values])) if values else 0.0,
+            }
+            for key, values in calibration_debug.items()
+        }
+    return predictions, retrieval_metrics, dynamic_metrics

@@ -88,27 +88,8 @@ class AdaptiveFusionV2:
     def _relu(self, hidden: np.ndarray) -> np.ndarray:
         return np.maximum(hidden, 0.0)
 
-    def forward(self, feature_array: np.ndarray) -> np.ndarray:
-        """Run the enhanced scorer and return one logit per candidate."""
-        hidden1 = self._relu(feature_array @ self.w1 + self.b1)
-        hidden1 = self._layer_norm(hidden1)
-        hidden2 = self._relu(hidden1 @ self.w2 + self.b2)
-        hidden2 = self._layer_norm(hidden2)
-        return (hidden2 @ self.w3 + self.b3).reshape(-1)
-
-    def predict_logits(self, feature_vectors: list[list[float]]) -> list[float]:
-        """Predict one relevance logit per candidate page."""
-        feature_array = np.asarray(feature_vectors, dtype=float)
-        if feature_array.size == 0:
-            return []
-        return self.forward(feature_array).tolist()
-
-    def predict(self, feature_vectors: list[list[float]]) -> list[float]:
-        """Backward-compatible prediction alias used by the generic trainer."""
-        return self.predict_logits(feature_vectors)
-
-    def train_step(self, feature_array: np.ndarray, labels: np.ndarray, learning_rate: float, weight_decay: float) -> float:
-        """Run one SGD step with BCE loss over the enhanced scorer."""
+    def _forward_with_cache(self, feature_array: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run the enhanced scorer and keep intermediate activations for backprop."""
         hidden1_pre = feature_array @ self.w1 + self.b1
         hidden1 = self._relu(hidden1_pre)
         hidden1 = self._layer_norm(hidden1)
@@ -116,12 +97,25 @@ class AdaptiveFusionV2:
         hidden2 = self._relu(hidden2_pre)
         hidden2 = self._layer_norm(hidden2)
         logits = (hidden2 @ self.w3 + self.b3).reshape(-1)
-        probabilities = 1.0 / (1.0 + np.exp(-logits))
-        probabilities = np.clip(probabilities, 1e-8, 1.0 - 1e-8)
-        labels = labels.astype(float)
-        loss = float(-(labels * np.log(probabilities) + (1.0 - labels) * np.log(1.0 - probabilities)).mean())
+        return hidden1_pre, hidden1, hidden2_pre, hidden2, logits
 
-        grad_logits = (probabilities - labels)[:, None] / max(len(labels), 1)
+    def forward(self, feature_array: np.ndarray) -> np.ndarray:
+        """Run the enhanced scorer and return one logit per candidate."""
+        return self._forward_with_cache(feature_array)[-1]
+
+    def _apply_gradient_step(
+        self,
+        feature_array: np.ndarray,
+        hidden1_pre: np.ndarray,
+        hidden1: np.ndarray,
+        hidden2_pre: np.ndarray,
+        hidden2: np.ndarray,
+        grad_logits: np.ndarray,
+        learning_rate: float,
+        weight_decay: float,
+    ) -> None:
+        """Apply one parameter update from externally computed logit gradients."""
+        grad_logits = grad_logits.reshape(-1, 1)
         grad_w3 = hidden2.T @ grad_logits + weight_decay * self.w3
         grad_b3 = grad_logits.sum(axis=0)
         grad_hidden2 = grad_logits @ self.w3.T
@@ -139,7 +133,83 @@ class AdaptiveFusionV2:
         self.b2 -= learning_rate * grad_b2
         self.w1 -= learning_rate * grad_w1
         self.b1 -= learning_rate * grad_b1
+
+    def predict_logits(self, feature_vectors: list[list[float]]) -> list[float]:
+        """Predict one relevance logit per candidate page."""
+        feature_array = np.asarray(feature_vectors, dtype=float)
+        if feature_array.size == 0:
+            return []
+        return self.forward(feature_array).tolist()
+
+    def predict(self, feature_vectors: list[list[float]]) -> list[float]:
+        """Backward-compatible prediction alias used by the generic trainer."""
+        return self.predict_logits(feature_vectors)
+
+    def train_step(self, feature_array: np.ndarray, labels: np.ndarray, learning_rate: float, weight_decay: float) -> float:
+        """Run one SGD step with BCE loss over the enhanced scorer."""
+        hidden1_pre, hidden1, hidden2_pre, hidden2, logits = self._forward_with_cache(feature_array)
+        probabilities = 1.0 / (1.0 + np.exp(-logits))
+        probabilities = np.clip(probabilities, 1e-8, 1.0 - 1e-8)
+        labels = labels.astype(float)
+        loss = float(-(labels * np.log(probabilities) + (1.0 - labels) * np.log(1.0 - probabilities)).mean())
+
+        grad_logits = (probabilities - labels) / max(len(labels), 1)
+        self._apply_gradient_step(
+            feature_array,
+            hidden1_pre,
+            hidden1,
+            hidden2_pre,
+            hidden2,
+            grad_logits,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
         return loss
+
+    def train_step_pairwise(
+        self,
+        feature_array: np.ndarray,
+        labels: np.ndarray,
+        learning_rate: float,
+        weight_decay: float,
+        margin: float = 1.0,
+        hard_negative_k: int = 3,
+    ) -> tuple[float, int]:
+        """Run one pairwise hard-negative ranking step."""
+        hidden1_pre, hidden1, hidden2_pre, hidden2, logits = self._forward_with_cache(feature_array)
+        positive_indices = np.where(labels > 0.5)[0]
+        negative_indices = np.where(labels <= 0.5)[0]
+        if positive_indices.size == 0 or negative_indices.size == 0:
+            return 0.0, 0
+
+        negative_indices = negative_indices[np.argsort(logits[negative_indices])[::-1]]
+        negative_indices = negative_indices[: max(int(hard_negative_k), 1)]
+        grad_logits = np.zeros_like(logits, dtype=float)
+        losses: list[float] = []
+        active_pairs = 0
+        for pos_index in positive_indices:
+            for neg_index in negative_indices:
+                loss_value = margin - logits[pos_index] + logits[neg_index]
+                if loss_value <= 0:
+                    continue
+                losses.append(float(loss_value))
+                grad_logits[pos_index] -= 1.0
+                grad_logits[neg_index] += 1.0
+                active_pairs += 1
+        if active_pairs == 0:
+            return 0.0, 0
+        grad_logits /= float(active_pairs)
+        self._apply_gradient_step(
+            feature_array,
+            hidden1_pre,
+            hidden1,
+            hidden2_pre,
+            hidden2,
+            grad_logits,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
+        return float(sum(losses) / max(len(losses), 1)), active_pairs
 
     def rank_candidates(self, candidate_rows: list[dict[str, Any]]) -> dict[str, list]:
         """Score and rank candidate pages from feature rows containing `feature_vector`."""

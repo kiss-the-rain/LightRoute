@@ -19,6 +19,37 @@ Metrics File
 
 - `outputs/metrics/visual_colqwen_val_metrics.json`
 
+## Latest Strong-Visual Fusion
+
+- Model: `adaptive_fusion_visual_colqwen_ocr_chunk`
+- Metric summary:
+  - Recall@1 = 0.6977
+  - Recall@5 = 0.8901
+  - Recall@10 = 0.9312
+  - MRR = 0.7811
+- Conclusion:
+  - 该新主线已经完成训练与验证，结果显著超过旧 fusion 主线，但仍未超过 `visual_colqwen`
+
+Train Command
+
+```bash
+python -m src.main --mode train_adaptive_fusion_visual_colqwen_ocr_chunk --device cuda:0
+```
+
+Eval Command
+
+```bash
+python -m src.main --mode eval_adaptive_fusion_visual_colqwen_ocr_chunk_val --device cuda:0
+```
+
+Checkpoint
+
+- `outputs/checkpoints/adaptive_fusion_visual_colqwen_ocr_chunk/adaptive_fusion_visual_colqwen_ocr_chunk_best.pkl`
+
+Metrics File
+
+- `outputs/metrics/adaptive_fusion_visual_colqwen_ocr_chunk_val_metrics.json`
+
 ## Current Best OCR-only
 
 - Model: `BGE chunk OCR-only`
@@ -69,4 +100,4 @@ Metrics File
 
 ## Current Research Question
 
-在更强 OCR-free visual retriever 已经很强的情况下，OCR chunk route 是否仍能继续带来页级检索增益？
+在更强 OCR-free visual retriever 已经很强的情况下，OCR route 是否仍能继续带来页级检索增益？当前已完成的 `adaptive_fusion_visual_colqwen_ocr_chunk` 结果尚未超过 `visual_colqwen-only`，因此下一步重点转向验证 OCR 路的边际收益是否已经接近饱和，以及是否需要进一步转向 retrieval-then-read。

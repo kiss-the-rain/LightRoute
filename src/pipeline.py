@@ -19,6 +19,9 @@ from src.retrieval.index_builder import build_text_index, build_visual_index, co
 from src.retrieval.retriever_manager import RetrieverManager
 from src.training.train_fusion import (
     train_fusion,
+    train_adaptive_fusion_dynamic_rules,
+    train_adaptive_fusion_gating_calibrated,
+    train_adaptive_fusion_learned_gating,
     train_fusion_ablation,
     train_fusion_mlp_ocrq_bge,
     train_fusion_mlp_ocrq_chunk,
@@ -34,6 +37,9 @@ from src.utils.seed_utils import set_seed
 from src.inference.infer_retrieval import (
     run_adaptive_fusion_on_dataset,
     run_adaptive_fusion_ablation_on_dataset,
+    run_adaptive_fusion_dynamic_rules_on_dataset,
+    run_adaptive_fusion_gating_calibrated_on_dataset,
+    run_adaptive_fusion_learned_gating_on_dataset,
     run_adaptive_fusion_mlp_ocrq_bge_on_dataset,
     run_adaptive_fusion_mlp_ocrq_chunk_on_dataset,
     run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset,
@@ -1073,6 +1079,91 @@ def infer_adaptive_fusion_visual_colqwen_ocr_chunk_test_pipeline(cfg: Any) -> No
     logger.info("Saved adaptive_fusion_visual_colqwen_ocr_chunk test predictions to %s", prediction_path)
     if metrics:
         logger.info("adaptive_fusion_visual_colqwen_ocr_chunk test metrics: %s", metrics)
+
+
+def train_adaptive_fusion_dynamic_rules_pipeline(cfg: Any) -> None:
+    """Train the new rule-based dynamic OCR/visual weighting family."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_dynamic_rules")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_adaptive_fusion_dynamic_rules(cfg)
+    logger.info("adaptive_fusion_dynamic_rules training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_dynamic_rules_val_pipeline(cfg: Any) -> None:
+    """Evaluate the rule-based dynamic OCR/visual weighting family on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_dynamic_rules_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_dynamic_rules_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_dynamic_rules_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_dynamic_rules_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_dynamic_rules val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_dynamic_rules val metrics to %s", metrics_path)
+
+
+def train_adaptive_fusion_learned_gating_pipeline(cfg: Any) -> None:
+    """Train the learned global-gating fusion family."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_learned_gating")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_adaptive_fusion_learned_gating(cfg)
+    logger.info("adaptive_fusion_learned_gating training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_learned_gating_val_pipeline(cfg: Any) -> None:
+    """Evaluate the learned global-gating fusion family on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_learned_gating_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_learned_gating_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_learned_gating_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_learned_gating_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_learned_gating val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_learned_gating val metrics to %s", metrics_path)
+
+
+def train_adaptive_fusion_gating_calibrated_pipeline(cfg: Any) -> None:
+    """Train the calibrated gating family with optional pairwise hard-negative loss."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_gating_calibrated")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_adaptive_fusion_gating_calibrated(cfg)
+    logger.info("adaptive_fusion_gating_calibrated training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
+
+
+def eval_adaptive_fusion_gating_calibrated_val_pipeline(cfg: Any) -> None:
+    """Evaluate the calibrated gating family on val."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_gating_calibrated_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_gating_calibrated_on_dataset(
+        cfg=cfg,
+        dataset_path=str(cfg.dataset.val_path),
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    calibration_name = str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw"))
+    loss_type = str(getattr(getattr(cfg, "dynamic_fusion", {}), "loss_type", "pointwise_bce"))
+    loss_suffix = "margin" if loss_type == "pairwise_margin" else "pointwise"
+    stage_suffix = f"{calibration_name}_{loss_suffix}"
+    prediction_path = Path(cfg.paths.prediction_dir) / f"adaptive_fusion_gating_calibrated_{stage_suffix}_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / f"adaptive_fusion_gating_calibrated_{stage_suffix}_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_gating_calibrated val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_gating_calibrated val metrics to %s", metrics_path)
 
 
 def train_adaptive_fusion_mlp_ocrq_chunkplus_pipeline(cfg: Any) -> None:

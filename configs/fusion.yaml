@@ -11,3 +11,19 @@ fusion:
   feature_dim: 16
   hidden_dim: 64
   dropout: 0.1
+
+dynamic_fusion:
+  rule_variant: combined
+  min_weight: 0.2
+  max_weight: 0.8
+  query_bias_scale: 0.18
+  page_correction_scale: 0.08
+  confidence_correction_scale: 0.08
+  gate_hidden_dim: 16
+  gate_learning_rate: 0.001
+  gate_weight_decay: 0.0001
+  calibration_option: raw
+  loss_type: pointwise_bce
+  pairwise_margin: 1.0
+  pairwise_hard_negative_k: 3
+  enable_feature_cache: true

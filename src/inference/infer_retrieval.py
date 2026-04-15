@@ -13,6 +13,7 @@ from src.evaluation.retrieval_metrics import evaluate_retrieval
 from src.retrieval.colpali_retriever import ColPaliRetriever
 from src.retrieval.colqwen_retriever import ColQwenRetriever
 from src.models.adaptive_fusion import AdaptiveFusion, AdaptiveFusionV2
+from src.models.gating_mlp import GateNet
 from src.models.fusion_fixed import FixedFusion
 from src.models.fusion_rrf import RRFFusion
 from src.models.question_encoder import QuestionEncoder
@@ -39,6 +40,7 @@ from src.retrieval.ocr_nv_retriever import OCRNVChunkRetriever
 from src.retrieval.ocr_page_pipeline import run_ocr_page_pipeline_for_sample
 from src.retrieval.fusion_features import (
     build_candidate_features as build_adaptive_candidate_features,
+    build_dynamic_gating_feature_vector,
     build_candidate_features_ablate_lex,
     build_candidate_features_ablate_mlp_lex,
     build_candidate_features_ablate_mlp,
@@ -49,6 +51,13 @@ from src.retrieval.fusion_features import (
     build_candidate_features_ablate_ocrq,
     build_candidate_features_ablate_q,
     build_candidate_features_v2,
+    refresh_candidate_feature_vectors,
+)
+from src.retrieval.dynamic_weighting import (
+    apply_branch_reweighting,
+    calibrate_route_scores,
+    compute_rule_based_weights,
+    summarize_weight_debug,
 )
 from src.retrieval.fusion import fixed_fusion, rrf_fusion
 from src.utils.io_utils import ensure_dir, load_jsonl, load_pickle, save_jsonl
@@ -2420,6 +2429,230 @@ def run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset(
     )
 
 
+def run_adaptive_fusion_dynamic_rules_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+    checkpoint_path: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Evaluate the staged rule-based dynamic fusion family."""
+    return _run_dynamic_fusion_family_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=topk,
+        k_values=k_values,
+        checkpoint_path=checkpoint_path,
+        stage_name="dynamic_rules",
+        checkpoint_subdir="adaptive_fusion_dynamic_rules",
+    )
+
+
+def run_adaptive_fusion_learned_gating_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+    checkpoint_path: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Evaluate the staged learned global-gating family."""
+    return _run_dynamic_fusion_family_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=topk,
+        k_values=k_values,
+        checkpoint_path=checkpoint_path,
+        stage_name="learned_gating",
+        checkpoint_subdir="adaptive_fusion_learned_gating",
+    )
+
+
+def run_adaptive_fusion_gating_calibrated_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+    checkpoint_path: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Evaluate the calibrated gating family with score normalization and optional margin loss."""
+    dynamic_cfg = getattr(cfg, "dynamic_fusion", {})
+    calibration_name = str(getattr(dynamic_cfg, "calibration_option", "raw"))
+    loss_type = str(getattr(dynamic_cfg, "loss_type", "pointwise_bce"))
+    loss_suffix = "margin" if loss_type == "pairwise_margin" else "pointwise"
+    stage_suffix = f"{calibration_name}_{loss_suffix}"
+    return _run_dynamic_fusion_family_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=topk,
+        k_values=k_values,
+        checkpoint_path=checkpoint_path,
+        stage_name="gating_calibrated",
+        checkpoint_subdir=f"adaptive_fusion_gating_calibrated_{stage_suffix}",
+    )
+
+
+def _run_dynamic_fusion_family_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int,
+    k_values: list[int] | None,
+    checkpoint_path: str | None,
+    stage_name: str,
+    checkpoint_subdir: str,
+) -> tuple[list[dict], dict]:
+    """Run one staged dynamic fusion family on a dataset split without changing old branches."""
+    logger = get_logger(f"adaptive_fusion_{stage_name}_retrieval")
+    records = load_jsonl(dataset_path)
+    logger.info("Running staged dynamic fusion on %s with %d samples stage=%s topk=%d", dataset_path, len(records), stage_name, topk)
+    logger.info(
+        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s ocr_bm25_coarse=%s calibration=%s loss_type=%s",
+        "colqwen",
+        "ocr_page_bm25_bge_rerank",
+        bool(getattr(cfg.retrieval_router, "enable_adaptive_coarse", False)),
+        bool(getattr(cfg.ocr_router, "enable_ocr_page_coarse", False)),
+        str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw")),
+        str(getattr(getattr(cfg, "dynamic_fusion", {}), "loss_type", "pointwise_bce")),
+    )
+
+    scorer, gate_model = _load_dynamic_fusion_bundle(
+        cfg,
+        stage_name=stage_name,
+        checkpoint_subdir=checkpoint_subdir,
+        checkpoint_path=checkpoint_path,
+    )
+    question_encoder = QuestionEncoder()
+    ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
+    visual_retriever = ColQwenRetriever(cfg)
+    visual_indexed_docs: set[str] = set()
+    visual_coarse_doc_text_cache: dict[str, list[str]] = {}
+    visual_coarse_doc_retriever_cache: dict[str, Any] = {}
+    ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_page_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_indexed_docs: set[str] = set()
+    ocr_coarse_doc_text_cache: dict[str, list[str]] = {}
+    ocr_coarse_doc_retriever_cache: dict[str, Any] = {}
+    predictions: list[dict] = []
+    cache_stats = {
+        "doc_visual_cache_hits": 0,
+        "doc_visual_cache_misses": 0,
+        "skipped_empty_candidates": 0,
+    }
+    visual_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="retrieval_router", stats_prefix="visual")
+    ocr_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="ocr_router", stats_prefix="ocr_bm25")
+    ocr_page_pipeline_stats = _build_ocr_page_pipeline_metric_accumulator()
+    weight_debug: list[dict[str, Any]] = []
+    calibration_debug: dict[str, list[dict[str, float]]] = {"visual_pre": [], "visual_post": [], "ocr_pre": [], "ocr_post": []}
+
+    for sample in tqdm(records, desc=f"DynamicFusion {Path(dataset_path).stem}", unit="sample"):
+        doc_id = str(sample["doc_id"])
+        ocr_result, ocr_stats = _retrieve_ocr_with_bm25_bge_reranker_for_sample(
+            cfg=cfg,
+            sample=sample,
+            topk=topk,
+            retriever=ocr_page_retriever,
+            indexed_docs=ocr_indexed_docs,
+            reranker=ocr_page_reranker,
+            bm25_doc_text_cache=ocr_coarse_doc_text_cache,
+            bm25_doc_retriever_cache=ocr_coarse_doc_retriever_cache,
+        )
+        visual_result, visual_stats = _retrieve_visual_with_adaptive_coarse_for_sample(
+            cfg=cfg,
+            sample=sample,
+            retriever=visual_retriever,
+            indexed_docs=visual_indexed_docs,
+            coarse_doc_text_cache=visual_coarse_doc_text_cache,
+            coarse_doc_retriever_cache=visual_coarse_doc_retriever_cache,
+        )
+        _accumulate_adaptive_coarse_metrics(visual_coarse_stats, visual_stats, stats_prefix="visual")
+        _accumulate_adaptive_coarse_metrics(ocr_coarse_stats, ocr_stats, stats_prefix="ocr_bm25")
+        _accumulate_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, ocr_stats)
+        for key, value in ocr_stats.items():
+            if key in ocr_coarse_stats or key in ocr_page_pipeline_stats:
+                continue
+            cache_stats[key] = cache_stats.get(key, 0) + value
+        for key, value in visual_stats.items():
+            if key in visual_coarse_stats:
+                continue
+            cache_stats[key] = cache_stats.get(key, 0) + value
+
+        candidate_rows = build_candidate_features_visual_colqwen_ocr_chunk(
+            sample,
+            ocr_result,
+            visual_result,
+            ocr_page_texts=ocr_coarse_doc_text_cache.get(doc_id),
+            question_encoder=question_encoder,
+            ocr_quality_cache=ocr_quality_cache,
+        )
+        if not candidate_rows:
+            cache_stats["skipped_empty_candidates"] += 1
+            continue
+        if stage_name == "gating_calibrated":
+            candidate_rows, calibration_stats = calibrate_route_scores(
+                candidate_rows,
+                option=str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw")),
+            )
+            for key in calibration_debug:
+                calibration_debug[key].append(calibration_stats.get(key, {}))
+        gating_features = build_dynamic_gating_feature_vector({"question": sample.get("question", "")}, candidate_rows)
+        if stage_name == "dynamic_rules":
+            alpha_v, alpha_o, debug_meta = compute_rule_based_weights(
+                candidate_rows,
+                sample,
+                variant=str(getattr(getattr(cfg, "dynamic_fusion", {}), "rule_variant", "combined")),
+                cfg=cfg,
+            )
+        else:
+            assert gate_model is not None
+            alpha_v, alpha_o = gate_model.predict_weights(gating_features["feature_vector"])
+            debug_meta = compute_rule_based_weights(candidate_rows, sample, variant="combined", cfg=cfg)[2]
+        weight_debug.append({"alpha_v": alpha_v, "alpha_o": alpha_o, **debug_meta})
+        weighted_rows = refresh_candidate_feature_vectors(
+            apply_branch_reweighting(candidate_rows, alpha_v=alpha_v, alpha_o=alpha_o)
+        )
+        ranked = scorer.rank_candidates(weighted_rows)
+        predictions.append(
+            {
+                "qid": sample["qid"],
+                "doc_id": doc_id,
+                "question": sample["question"],
+                "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
+                "pred_page_ids": ranked["page_ids"][:topk],
+                "pred_scores": ranked["scores"][:topk],
+                "topk": topk,
+            }
+        )
+
+    if k_values is None:
+        k_values = [1, 5, 10]
+    labeled_predictions = [item for item in predictions if item.get("evidence_pages")]
+    metrics = evaluate_retrieval(labeled_predictions, k_values) if labeled_predictions else {}
+    metrics.update(
+        {
+            "num_samples": len(predictions),
+            "num_unique_docs": len(set(item["doc_id"] for item in records)),
+            **cache_stats,
+        }
+    )
+    metrics.update(summarize_adaptive_coarse_stats(visual_coarse_stats, len(records), stats_prefix="visual"))
+    metrics.update(summarize_adaptive_coarse_stats(ocr_coarse_stats, len(records), stats_prefix="ocr_bm25"))
+    metrics.update(add_ocr_bm25_metric_aliases(metrics))
+    metrics.update(summarize_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, len(records)))
+    dynamic_metrics = summarize_weight_debug(weight_debug)
+    dynamic_metrics["rule_variant_name"] = str(getattr(getattr(cfg, "dynamic_fusion", {}), "rule_variant", "combined"))
+    if any(calibration_debug[key] for key in calibration_debug):
+        dynamic_metrics["calibration_debug"] = {
+            key: {
+                "mean": float(sum(item.get("mean", 0.0) for item in values) / max(len(values), 1)),
+                "std": float(sum(item.get("std", 0.0) for item in values) / max(len(values), 1)),
+                "min": float(sum(item.get("min", 0.0) for item in values) / max(len(values), 1)),
+                "max": float(sum(item.get("max", 0.0) for item in values) / max(len(values), 1)),
+            }
+            for key, values in calibration_debug.items()
+        }
+    metrics.update(dynamic_metrics)
+    logger.info("adaptive_fusion_%s metrics: %s", stage_name, metrics)
+    return predictions, metrics
+
 def run_adaptive_fusion_mlp_ocrq_hybrid_on_dataset(
     cfg: Any,
     dataset_path: str,
@@ -2815,6 +3048,35 @@ def _load_adaptive_ablation_mlp_model_from_checkpoint(
     )
     model.load_state_dict(model_state)
     return model
+
+
+def _load_dynamic_fusion_bundle(
+    cfg: Any,
+    stage_name: str,
+    checkpoint_subdir: str,
+    checkpoint_path: str | None = None,
+) -> tuple[AdaptiveFusionV2, GateNet | None]:
+    """Load the staged dynamic fusion scorer and optional global gate."""
+    resolved_path = checkpoint_path or str(Path(cfg.paths.checkpoint_dir) / checkpoint_subdir / f"{checkpoint_subdir}_best.pkl")
+    checkpoint = load_pickle(resolved_path)
+    model_state = checkpoint["model_state"]
+    scorer = AdaptiveFusionV2(
+        feature_dim=int(model_state.get("feature_dim", 22)),
+        hidden_dim=int(model_state.get("hidden_dim", cfg.fusion.hidden_dim)),
+        dropout=float(model_state.get("dropout", cfg.fusion.dropout)),
+    )
+    scorer.load_state_dict(model_state)
+    gate_state = checkpoint.get("gate_state")
+    if stage_name == "dynamic_rules" or not gate_state:
+        return scorer, None
+    gate_model = GateNet(
+        input_dim=int(gate_state.get("input_dim", 0)),
+        hidden_dim=int(gate_state.get("hidden_dim", getattr(getattr(cfg, "dynamic_fusion", {}), "gate_hidden_dim", 16))),
+        min_weight=float(gate_state.get("min_weight", getattr(getattr(cfg, "dynamic_fusion", {}), "min_weight", 0.2))),
+        max_weight=float(gate_state.get("max_weight", getattr(getattr(cfg, "dynamic_fusion", {}), "max_weight", 0.8))),
+    )
+    gate_model.load_state_dict(gate_state)
+    return scorer, gate_model
 
 
 def infer_retrieval(
