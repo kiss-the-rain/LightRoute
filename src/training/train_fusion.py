@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from src.data.vidore_energy_loader import load_vidore_energy_dataset
 from src.evaluation.retrieval_metrics import evaluate_retrieval
 from src.inference.infer_retrieval import (
     add_ocr_bm25_metric_aliases,
@@ -24,8 +25,10 @@ from src.inference.infer_retrieval import (
     _retrieve_ocr_with_page_coarse_for_sample,
     _retrieve_ocr_hybrid_for_sample,
     _retrieve_ocr_nv_chunk_for_sample,
+    _retrieve_visual_nemotron_energy_for_sample,
     _retrieve_visual_for_sample,
     _retrieve_visual_with_adaptive_coarse_for_sample,
+    _vidore_energy_sample_to_processed_sample,
     summarize_ocr_page_pipeline_metrics,
     summarize_adaptive_coarse_stats,
 )
@@ -42,6 +45,7 @@ from src.retrieval.ocr_bge_reranker import OCRBGEReranker
 from src.retrieval.ocr_chunker import OCRChunkBuilder
 from src.retrieval.ocr_hybrid_retriever import OCRHybridRetriever
 from src.retrieval.ocr_nv_retriever import OCRNVChunkRetriever
+from src.retrieval.nemotron_visual_retriever import NemotronVisualRetriever
 from src.retrieval.fusion_features import (
     build_dynamic_gating_feature_vector,
     build_candidate_features,
@@ -318,14 +322,17 @@ def _train_fusion_variant(
     ocr_semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
     ocr_reranker_cfg = getattr(cfg, "ocr_reranker", None)
     logger.info(
-        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bypass_threshold=%s visual_coarse_topk=%s "
-        "ocr_page_coarse=%s ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
+        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bm25_coarse=%s "
+        "visual_bypass_threshold=%s visual_coarse_topk=%s ocr_page_coarse=%s ocr_bm25_coarse=%s "
+        "ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
         visual_backend,
         ocr_backend,
         bool(use_adaptive_coarse_visual and getattr(visual_router_cfg, "enable_adaptive_coarse", False)),
+        bool(getattr(visual_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(visual_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(visual_router_cfg, "coarse_topk", 0) or 0),
         bool(use_ocr_page_coarse and getattr(ocr_router_cfg, "enable_ocr_page_coarse", False)),
+        bool(getattr(ocr_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(ocr_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(ocr_router_cfg, "coarse_topk", 0) or 0),
         int(getattr(ocr_semantic_cfg, "semantic_topk", 0) or 0),
@@ -825,6 +832,369 @@ def train_adaptive_fusion_gating_calibrated(cfg: Any) -> dict[str, Any]:
         metric_filename=f"adaptive_fusion_gating_calibrated_{stage_suffix}_val_metrics.json",
         train_metric_filename=f"{cfg.experiment.name}_train_adaptive_fusion_gating_calibrated_{stage_suffix}_metrics.json",
     )
+
+
+def train_adaptive_fusion_visual_nemotron_ocr_energy(cfg: Any) -> dict[str, Any]:
+    """Train only the fusion MLP on frozen Nemotron visual signals + existing OCR route."""
+    logger_name = "train_adaptive_fusion_visual_nemotron_ocr_energy"
+    checkpoint_subdir = "adaptive_fusion_visual_nemotron_ocr_energy"
+    logger = get_logger(logger_name, log_file=Path(cfg.paths.log_dir) / f"{cfg.experiment.name}_{checkpoint_subdir}.log")
+    nemotron_cfg = cfg.visual_nemotron_energy
+    logger.info("Training adaptive_fusion_visual_nemotron_ocr_energy")
+    logger.info("local visual model=%s dataset=%s device=%s", nemotron_cfg.model_name, nemotron_cfg.dataset_path, nemotron_cfg.device)
+    logger.info(
+        "Running OCR branch unchanged: backend=%s page_coarse=%s bm25_coarse=%s semantic_topk=%s rerank_topk=%s",
+        "ocr_page_bm25_bge_rerank",
+        bool(getattr(cfg.ocr_router, "enable_ocr_page_coarse", False)),
+        bool(getattr(cfg.ocr_router, "enable_bm25_coarse", True)),
+        int(getattr(cfg.ocr_semantic_retrieval, "semantic_topk", 0) or 0),
+        int(getattr(cfg.ocr_reranker, "rerank_topk", 0) or 0),
+    )
+
+    samples, dataset_summary = load_vidore_energy_dataset(str(nemotron_cfg.dataset_path), max_samples=0)
+    train_samples, val_samples, split_summary = _split_vidore_energy_samples(cfg, samples)
+    logger.info("ViDoRe Energy dataset summary: %s", dataset_summary)
+    logger.info("ViDoRe Energy train/val split summary: %s", split_summary)
+    if not train_samples or not val_samples:
+        metrics = {
+            "status": "skipped",
+            "reason": "ViDoRe Energy train/val split is empty",
+            "dataset_summary": dataset_summary,
+            "split_summary": split_summary,
+        }
+        save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json")
+        return metrics
+
+    train_payload = _load_or_build_visual_nemotron_energy_batches(cfg, train_samples, split_name="train", logger=logger)
+    val_payload = _load_or_build_visual_nemotron_energy_batches(cfg, val_samples, split_name="val", logger=logger)
+    train_batches = train_payload["batches"]
+    val_batches = val_payload["batches"]
+    if not train_batches or not val_batches:
+        metrics = {
+            "status": "skipped",
+            "reason": "visual_nemotron_ocr_energy batches are empty",
+            "dataset_summary": dataset_summary,
+            "split_summary": split_summary,
+            "train_batch_stats": train_payload["stats"],
+            "val_batch_stats": val_payload["stats"],
+        }
+        save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json")
+        return metrics
+
+    feature_dim = len(train_batches[0]["candidate_rows"][0].get("feature_vector", []))
+    model = AdaptiveFusionV2(
+        feature_dim=feature_dim,
+        hidden_dim=int(cfg.fusion.hidden_dim),
+        dropout=float(cfg.fusion.dropout),
+    )
+    checkpoint_dir = Path(cfg.paths.checkpoint_dir) / checkpoint_subdir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_best.pkl"
+    last_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_last.pkl"
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_predictions.jsonl"
+    metric_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_metrics.json"
+    train_metric_path = Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json"
+
+    best_mrr = float("-inf")
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    patience = int(cfg.training.early_stopping_patience)
+    total_epochs = int(cfg.training.epochs)
+    epoch_iterator = tqdm(range(total_epochs), desc="visual_nemotron_ocr_energy epochs", unit="epoch")
+    for epoch in epoch_iterator:
+        train_metrics = _run_visual_nemotron_energy_train_epoch(cfg, model, train_batches)
+        val_predictions, val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_batches)
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            **train_metrics,
+            "val_mrr": float(val_metrics.get("MRR", 0.0)),
+            "val_recall@1": float(val_metrics.get("Recall@1", 0.0)),
+        }
+        history.append(epoch_metrics)
+        checkpoint = {
+            "epoch": epoch + 1,
+            "metric": float(val_metrics.get("MRR", 0.0)),
+            "metric_name": "val_mrr",
+            "branch_name": "adaptive_fusion_visual_nemotron_ocr_energy",
+            "model_state": model.state_dict(),
+        }
+        save_pickle(checkpoint, last_checkpoint_path)
+        if float(val_metrics.get("MRR", 0.0)) > best_mrr:
+            best_mrr = float(val_metrics.get("MRR", 0.0))
+            best_epoch = epoch + 1
+            save_pickle(checkpoint, best_checkpoint_path)
+            save_jsonl(val_predictions, prediction_path)
+            save_json(val_metrics, metric_path)
+        logger.info("Epoch %d visual_nemotron_ocr_energy metrics: %s", epoch + 1, epoch_metrics)
+        epoch_iterator.set_postfix(
+            train_loss=f"{float(train_metrics.get('train_loss', 0.0)):.4f}",
+            val_mrr=f"{float(val_metrics.get('MRR', 0.0)):.4f}",
+        )
+        if epoch + 1 - best_epoch >= patience:
+            logger.info("Early stopping triggered at epoch %d", epoch + 1)
+            break
+
+    best_checkpoint = load_pickle(best_checkpoint_path)
+    model.load_state_dict(best_checkpoint["model_state"])
+    val_predictions, val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_batches)
+    save_jsonl(val_predictions, prediction_path)
+    save_json(val_metrics, metric_path)
+    metrics = {
+        "best_val_mrr": best_mrr,
+        "best_epoch": best_epoch,
+        "history": history,
+        "checkpoint_path": str(best_checkpoint_path),
+        "dataset_summary": dataset_summary,
+        "split_summary": split_summary,
+        "train_batch_stats": train_payload["stats"],
+        "val_batch_stats": val_payload["stats"],
+        "val_retrieval_metrics": val_metrics,
+    }
+    save_json(metrics, train_metric_path)
+    logger.info("Best checkpoint selected by val_mrr. checkpoint=%s", best_checkpoint_path)
+    logger.info("adaptive_fusion_visual_nemotron_ocr_energy training completed: %s", metrics)
+    return metrics
+
+
+def _split_vidore_energy_samples(cfg: Any, samples: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Create a deterministic train/val split for the local Energy subset when no official split is exposed."""
+    sorted_samples = sorted(samples, key=lambda item: str(item.get("qid", "")))
+    val_ratio = float(getattr(getattr(cfg, "visual_nemotron_energy", {}), "val_ratio", 0.2))
+    val_ratio = min(max(val_ratio, 0.05), 0.5)
+    val_count = max(1, int(round(len(sorted_samples) * val_ratio))) if len(sorted_samples) > 1 else 0
+    train_samples = sorted_samples[:-val_count] if val_count else sorted_samples
+    val_samples = sorted_samples[-val_count:] if val_count else []
+    max_train_samples = int(getattr(cfg.training, "max_train_samples", 0) or 0)
+    max_val_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    if max_train_samples > 0:
+        train_samples = train_samples[:max_train_samples]
+    if max_val_samples > 0:
+        val_samples = val_samples[:max_val_samples]
+    return train_samples, val_samples, {
+        "split_policy": "deterministic_qid_sorted_80_20",
+        "val_ratio": val_ratio,
+        "num_total_samples": len(samples),
+        "num_train_samples": len(train_samples),
+        "num_val_samples": len(val_samples),
+        "max_train_samples": max_train_samples,
+        "max_val_samples": max_val_samples,
+    }
+
+
+def _visual_nemotron_energy_config_signature(cfg: Any, samples: list[dict[str, Any]], split_name: str) -> str:
+    """Build a cache signature for branch-specific feature rows."""
+    nemotron_cfg = getattr(cfg, "visual_nemotron_energy", {})
+    payload = {
+        "branch": "adaptive_fusion_visual_nemotron_ocr_energy",
+        "split_name": split_name,
+        "sample_qids": [str(item.get("qid", "")) for item in samples],
+        "model_name": str(getattr(nemotron_cfg, "model_name", "")),
+        "dataset_path": str(getattr(nemotron_cfg, "dataset_path", "")),
+        "ocr_backend": "ocr_page_bm25_bge_rerank",
+        "ocr_page_coarse": bool(getattr(getattr(cfg, "ocr_router", {}), "enable_ocr_page_coarse", False)),
+        "ocr_bm25_coarse": bool(getattr(getattr(cfg, "ocr_router", {}), "enable_bm25_coarse", True)),
+        "semantic_topk": int(getattr(getattr(cfg, "ocr_semantic_retrieval", {}), "semantic_topk", 0) or 0),
+        "rerank_topk": int(getattr(getattr(cfg, "ocr_reranker", {}), "rerank_topk", 0) or 0),
+        "feature_builder": "build_candidate_features_visual_colqwen_ocr_chunk",
+    }
+    digest = hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:10]
+
+
+def _load_or_build_visual_nemotron_energy_batches(
+    cfg: Any,
+    samples: list[dict[str, Any]],
+    split_name: str,
+    logger: Any,
+) -> dict[str, Any]:
+    """Load or build branch-specific candidate feature batches for frozen Nemotron/OCR retrievers."""
+    nemotron_cfg = getattr(cfg, "visual_nemotron_energy", {})
+    feature_cache_enabled = bool(getattr(nemotron_cfg, "enable_feature_cache", True))
+    signature = _visual_nemotron_energy_config_signature(cfg, samples, split_name)
+    cache_dir = Path(cfg.paths.cache_dir) / "fusion_visual_nemotron_ocr_energy"
+    cache_path = cache_dir / f"{split_name}_{signature}.pkl"
+    if feature_cache_enabled and cache_path.exists():
+        logger.info("Loaded visual_nemotron_ocr_energy %s batches from cache: %s", split_name, cache_path)
+        payload = load_pickle(cache_path)
+        payload["stats"]["feature_cache_hits"] = int(payload["stats"].get("feature_cache_hits", 0)) + 1
+        return payload
+    if not feature_cache_enabled:
+        logger.info("visual_nemotron_ocr_energy feature cache disabled; rebuilding %s batches.", split_name)
+
+    batches, stats = _build_visual_nemotron_energy_batches(cfg, samples, split_name=split_name, logger=logger)
+    payload = {
+        "batches": batches,
+        "stats": {
+            **stats,
+            "feature_cache_hits": 0,
+            "feature_cache_misses": 1,
+            "cache_path": str(cache_path) if feature_cache_enabled else "",
+            "config_signature": signature,
+            "split_name": split_name,
+            "feature_cache_enabled": feature_cache_enabled,
+        },
+    }
+    if feature_cache_enabled:
+        save_pickle(payload, cache_path)
+    return payload
+
+
+def _build_visual_nemotron_energy_batches(
+    cfg: Any,
+    samples: list[dict[str, Any]],
+    split_name: str,
+    logger: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Construct training/eval batches from frozen Nemotron visual and existing OCR route outputs."""
+    nemotron_cfg = cfg.visual_nemotron_energy
+    question_encoder = QuestionEncoder()
+    ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
+    visual_retriever = NemotronVisualRetriever(
+        model_path=str(nemotron_cfg.model_name),
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_page_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_indexed_docs: set[str] = set()
+    ocr_coarse_doc_text_cache: dict[str, list[str]] = {}
+    ocr_coarse_doc_retriever_cache: dict[str, Any] = {}
+    ocr_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="ocr_router", stats_prefix="ocr_bm25")
+    ocr_page_pipeline_stats = _build_ocr_page_pipeline_metric_accumulator()
+    batches: list[dict[str, Any]] = []
+    stats: dict[str, Any] = {
+        "num_samples": len(samples),
+        "num_built_batches": 0,
+        "skipped_empty_candidates": 0,
+        "skipped_missing_positive": 0,
+        "visual_embedding_cache_hits": 0,
+        "visual_embedding_cache_misses": 0,
+    }
+    logger.info("Building visual_nemotron_ocr_energy %s batches with frozen retrievers: %d samples", split_name, len(samples))
+    for raw_sample in tqdm(samples, desc=f"NemotronFusionBatches {split_name}", unit="sample"):
+        sample = _vidore_energy_sample_to_processed_sample(raw_sample)
+        evidence_pages = {int(page) for page in sample.get("evidence_pages", [])}
+        visual_result, visual_stats = _retrieve_visual_nemotron_energy_for_sample(raw_sample, visual_retriever)
+        stats["visual_embedding_cache_hits"] += int(visual_stats.get("embedding_cache_hits", 0))
+        stats["visual_embedding_cache_misses"] += int(visual_stats.get("embedding_cache_misses", 0))
+        ocr_result, ocr_stats = _retrieve_ocr_with_bm25_bge_reranker_for_sample(
+            cfg=cfg,
+            sample=sample,
+            topk=int(cfg.retrieval.topk),
+            retriever=ocr_page_retriever,
+            indexed_docs=ocr_indexed_docs,
+            reranker=ocr_page_reranker,
+            bm25_doc_text_cache=ocr_coarse_doc_text_cache,
+            bm25_doc_retriever_cache=ocr_coarse_doc_retriever_cache,
+        )
+        _accumulate_adaptive_coarse_metrics(ocr_coarse_stats, ocr_stats, stats_prefix="ocr_bm25")
+        _accumulate_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, ocr_stats)
+        candidate_rows = build_candidate_features_visual_colqwen_ocr_chunk(
+            sample,
+            ocr_result,
+            visual_result,
+            ocr_page_texts=ocr_coarse_doc_text_cache.get(str(sample["doc_id"])),
+            question_encoder=question_encoder,
+            ocr_quality_cache=ocr_quality_cache,
+        )
+        if not candidate_rows:
+            stats["skipped_empty_candidates"] += 1
+            continue
+        labels = [1.0 if int(row["page_id"]) in evidence_pages else 0.0 for row in candidate_rows]
+        if not any(label > 0.5 for label in labels):
+            stats["skipped_missing_positive"] += 1
+            continue
+        batches.append(
+            {
+                "qid": sample["qid"],
+                "doc_id": sample["doc_id"],
+                "question": sample.get("question", ""),
+                "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
+                "candidate_rows": candidate_rows,
+                "labels": labels,
+            }
+        )
+    visual_retriever.save_cache()
+    stats["num_built_batches"] = len(batches)
+    stats.update(summarize_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, len(samples)))
+    stats.update(add_ocr_bm25_metric_aliases(summarize_adaptive_coarse_stats(ocr_coarse_stats, len(samples), stats_prefix="ocr_bm25")))
+    stats.update(visual_retriever.cache_stats())
+    return batches, stats
+
+
+def _run_visual_nemotron_energy_train_epoch(
+    cfg: Any,
+    model: AdaptiveFusionV2,
+    train_batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Train one epoch of the branch-specific fusion MLP."""
+    learning_rate = float(cfg.training.learning_rate)
+    weight_decay = float(cfg.training.weight_decay)
+    total_loss = 0.0
+    total_batches = 0
+    total_candidates = 0
+    for batch in tqdm(train_batches, desc="visual_nemotron_ocr_energy train", unit="sample", leave=False):
+        features = np.asarray([list(row["feature_vector"]) for row in batch["candidate_rows"]], dtype=float)
+        labels = np.asarray(batch["labels"], dtype=float)
+        loss = model.train_step(features, labels, learning_rate=learning_rate, weight_decay=weight_decay)
+        total_loss += float(loss)
+        total_batches += 1
+        total_candidates += len(labels)
+    return {
+        "train_loss": total_loss / max(total_batches, 1),
+        "num_positive_samples": sum(1 for batch in train_batches if any(label > 0.5 for label in batch.get("labels", []))),
+        "num_train_batches": total_batches,
+        "avg_candidates_per_sample": float(total_candidates / max(total_batches, 1)),
+    }
+
+
+def _eval_visual_nemotron_energy_batches(
+    cfg: Any,
+    model: AdaptiveFusionV2,
+    batches: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Evaluate branch-specific fusion MLP over cached candidate batches."""
+    predictions: list[dict[str, Any]] = []
+    for batch in tqdm(batches, desc="visual_nemotron_ocr_energy eval", unit="sample", leave=False):
+        ranked = model.rank_candidates(batch["candidate_rows"])
+        predictions.append(
+            {
+                "qid": batch["qid"],
+                "doc_id": batch["doc_id"],
+                "question": batch.get("question", ""),
+                "evidence_pages": [int(page) for page in batch.get("evidence_pages", [])],
+                "pred_page_ids": [int(page_id) for page_id in ranked["page_ids"][: int(cfg.retrieval.topk)]],
+                "pred_scores": [float(score) for score in ranked["scores"][: int(cfg.retrieval.topk)]],
+                "topk": int(cfg.retrieval.topk),
+            }
+        )
+    labeled_predictions = [item for item in predictions if item.get("evidence_pages")]
+    metrics = evaluate_retrieval(labeled_predictions, list(cfg.retrieval.k_values)) if labeled_predictions else {}
+    metrics["num_samples"] = len(predictions)
+    metrics["NDCG@10"] = _ndcg_at_k_for_predictions(labeled_predictions, k=10) if labeled_predictions else 0.0
+    return predictions, metrics
+
+
+def _ndcg_at_k_for_predictions(predictions: list[dict[str, Any]], k: int) -> float:
+    """Compute binary NDCG@K for branch validation predictions."""
+    if not predictions:
+        return 0.0
+    total = 0.0
+    for item in predictions:
+        evidence = {int(page) for page in item.get("evidence_pages", [])}
+        if not evidence:
+            continue
+        dcg = 0.0
+        for index, page_id in enumerate(item.get("pred_page_ids", [])[:k], start=1):
+            if int(page_id) in evidence:
+                dcg += 1.0 / np.log2(index + 1)
+        ideal_hits = min(len(evidence), k)
+        idcg = sum(1.0 / np.log2(index + 1) for index in range(1, ideal_hits + 1))
+        total += dcg / max(idcg, 1e-8)
+    return float(total / len(predictions))
 
 
 def _train_dynamic_fusion_family(

@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 import re
+import time
 from typing import Any, Callable
 
+import numpy as np
 from tqdm import tqdm
 
+from src.data.vidore_energy_loader import load_vidore_energy_dataset
 from src.evaluation.retrieval_metrics import evaluate_retrieval
 from src.retrieval.colpali_retriever import ColPaliRetriever
 from src.retrieval.colqwen_retriever import ColQwenRetriever
@@ -37,7 +40,11 @@ from src.retrieval.ocr_chunker import OCRChunkBuilder, aggregate_chunk_scores_to
 from src.retrieval.ocr_hybrid_retriever import OCRHybridRetriever
 from src.retrieval.ocr_jina_retriever import OCRJinaChunkRetriever
 from src.retrieval.ocr_nv_retriever import OCRNVChunkRetriever
-from src.retrieval.ocr_page_pipeline import run_ocr_page_pipeline_for_sample
+from src.retrieval.ocr_page_pipeline import (
+    run_ocr_page_pipeline_for_sample,
+    run_ocr_page_pipeline_for_subset,
+)
+from src.retrieval.nemotron_visual_retriever import NemotronVisualRetriever
 from src.retrieval.fusion_features import (
     build_candidate_features as build_adaptive_candidate_features,
     build_dynamic_gating_feature_vector,
@@ -333,6 +340,7 @@ def _build_adaptive_coarse_metric_accumulator(cfg: Any, router_attr: str, stats_
         f"{stats_prefix}_coarse_index_cache_hits": 0,
         f"{stats_prefix}_coarse_index_cache_misses": 0,
         f"{stats_prefix}_coarse_method": str(getattr(router_cfg, "coarse_method", "bm25")),
+        f"{stats_prefix}_bm25_coarse_enabled": bool(getattr(router_cfg, "enable_bm25_coarse", True)),
         f"{stats_prefix}_bypass_threshold": int(getattr(router_cfg, "bypass_threshold", 0) or 0),
         f"{stats_prefix}_coarse_topk": int(getattr(router_cfg, "coarse_topk", 0) or 0),
     }
@@ -833,6 +841,1524 @@ def run_visual_colqwen_retrieval_on_dataset(
     return predictions, metrics
 
 
+def run_visual_nemotron_energy_on_dataset(
+    cfg: Any,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+) -> tuple[list[dict], dict]:
+    """Run local nemotron-colembed-vl visual-only retrieval on ViDoRe V3 Energy."""
+    logger = get_logger("visual_nemotron_energy_retrieval")
+    nemotron_cfg = cfg.visual_nemotron_energy
+    dataset_path = str(nemotron_cfg.dataset_path)
+    model_path = str(nemotron_cfg.model_name)
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    samples, dataset_summary = load_vidore_energy_dataset(dataset_path, max_samples=max_samples)
+    logger.info(
+        "Running visual nemotron energy retrieval. model=%s dataset=%s device=%s samples=%d topk=%d",
+        model_path,
+        dataset_path,
+        str(nemotron_cfg.device),
+        len(samples),
+        topk,
+    )
+
+    retriever = NemotronVisualRetriever(
+        model_path=model_path,
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    if not bool(getattr(nemotron_cfg, "enable_embedding_cache", True)):
+        logger.info("Nemotron embedding cache disabled; all page embeddings will be recomputed.")
+    predictions: list[dict] = []
+    total_candidates = 0
+    constant_score_samples = 0
+    start_time = time.perf_counter()
+    for sample_index, sample in enumerate(tqdm(samples, desc="VisualNemotronEnergy", unit="sample")):
+        candidates = list(sample.get("candidates", []))
+        total_candidates += len(candidates)
+        query_text = _get_vidore_energy_query_text(sample)
+        result = retriever.retrieve(query_text, candidates, topk=topk)
+        pred_internal_page_ids = [int(page_id) for page_id in result["page_ids"]]
+        pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, pred_internal_page_ids)
+        gold_corpus_ids = [str(corpus_id) for corpus_id in sample.get("gold_corpus_ids", sample.get("positive_corpus_ids", []))]
+        _validate_vidore_corpus_id_space(sample, pred_corpus_ids, gold_corpus_ids)
+        if len(pred_corpus_ids) != len(result["scores"]):
+            raise RuntimeError(
+                "ViDoRe Energy prediction alignment failed: pred_corpus_ids and pred_scores have different lengths. "
+                f"query_id={sample.get('query_id', sample.get('qid', ''))}"
+            )
+        score_span = max(result["scores"]) - min(result["scores"]) if len(result["scores"]) > 1 else 0.0
+        if len(result["scores"]) > 1 and abs(score_span) < 1e-8:
+            constant_score_samples += 1
+        if sample_index < 3:
+            _log_visual_nemotron_debug_sample(
+                logger=logger,
+                sample_index=sample_index,
+                sample=sample,
+                query_text=query_text,
+                result=result,
+                pred_corpus_ids=pred_corpus_ids,
+                gold_corpus_ids=gold_corpus_ids,
+                candidates=candidates,
+            )
+        prediction = {
+            "qid": sample["qid"],
+            "query_id": sample.get("query_id", sample["qid"]),
+            "doc_id": sample.get("doc_id", "vidore_v3_energy"),
+            "query": query_text,
+            "gold_corpus_ids": gold_corpus_ids,
+            "pred_corpus_ids": pred_corpus_ids,
+            "pred_scores": [float(score) for score in result["scores"]],
+            "topk": topk,
+        }
+        _assert_vidore_prediction_uses_corpus_ids(prediction)
+        predictions.append(prediction)
+    retriever.save_cache()
+    runtime_seconds = time.perf_counter() - start_time
+
+    if k_values is None:
+        k_values = [1, 5, 10]
+    labeled_predictions = [item for item in predictions if item.get("gold_corpus_ids")]
+    metrics = _evaluate_vidore_corpus_retrieval(labeled_predictions, k_values) if labeled_predictions else {}
+    metrics["NDCG@10"] = _ndcg_corpus_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    metrics.update(
+        {
+            "num_samples": len(predictions),
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_pages": int(dataset_summary.get("num_candidate_images", 0)),
+            "avg_candidate_set_size": float(total_candidates / max(len(samples), 1)),
+            "id_space": "corpus_id",
+            "constant_score_samples": int(constant_score_samples),
+            "constant_score_sample_ratio": float(constant_score_samples / max(len(predictions), 1)),
+            "runtime_seconds": runtime_seconds,
+            "model_path": model_path,
+            "dataset_path": dataset_path,
+            **retriever.cache_stats(),
+        }
+    )
+    if predictions and constant_score_samples / max(len(predictions), 1) > 0.2:
+        logger.warning(
+            "Visual nemotron scores are nearly constant for %.2f%% of samples. Check model scoring/image input.",
+            100.0 * constant_score_samples / max(len(predictions), 1),
+        )
+    logger.info("Visual nemotron energy dataset summary: %s", dataset_summary)
+    logger.info("Visual nemotron retrieval metrics: %s", metrics)
+    return predictions, metrics
+
+
+def run_bm25_vidore_energy_on_dataset(
+    cfg: Any,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+) -> tuple[list[dict], dict]:
+    """Run BM25-only retrieval on ViDoRe Energy in canonical corpus_id space."""
+    logger = get_logger("bm25_vidore_energy_retrieval")
+    bm25_cfg = getattr(cfg, "bm25_vidore_energy", {})
+    dataset_path = str(getattr(bm25_cfg, "dataset_path", getattr(cfg.visual_nemotron_energy, "dataset_path", "")))
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    samples, dataset_summary = load_vidore_energy_dataset(dataset_path, max_samples=max_samples)
+    if not samples:
+        raise RuntimeError(f"ViDoRe Energy BM25 evaluation found no samples: dataset_path={dataset_path}")
+
+    candidates = list(samples[0].get("candidates", []))
+    if not candidates:
+        raise RuntimeError("ViDoRe Energy BM25 evaluation found no candidate pages.")
+    page_ids = [int(candidate.get("page_id", index)) for index, candidate in enumerate(candidates)]
+    page_texts = [str(candidate.get("ocr_text", "") or candidate.get("markdown", "") or "") for candidate in candidates]
+    if not any(text.strip() for text in page_texts):
+        raise RuntimeError("ViDoRe Energy BM25 evaluation found no usable page text in corpus.markdown / ocr_text.")
+
+    retriever = BM25Retriever()
+    retriever.build_index(page_texts=page_texts, page_ids=page_ids)
+    configured_k_values = list(k_values) if k_values is not None else list(getattr(cfg.retrieval, "k_values", [1, 5, 10]))
+    sweep_topks = sorted(
+        {
+            int(value)
+            for value in (list(getattr(bm25_cfg, "sweep_topks", [])) + configured_k_values + [int(topk)])
+            if int(value) > 0
+        }
+    )
+    max_topk = min(max(sweep_topks or [int(topk)]), len(page_ids))
+    logger.info(
+        "Running BM25-only ViDoRe Energy retrieval. dataset=%s samples=%d max_topk=%d sweep_topks=%s",
+        dataset_path,
+        len(samples),
+        max_topk,
+        sweep_topks,
+    )
+
+    predictions: list[dict[str, Any]] = []
+    total_candidates = 0
+    start_time = time.perf_counter()
+    for sample_index, sample in enumerate(tqdm(samples, desc="BM25ViDoReEnergy", unit="sample")):
+        query_text = _get_vidore_energy_query_text(sample)
+        result = retriever.retrieve(query_text, topk=max_topk)
+        pred_internal_page_ids = [int(page_id) for page_id in result["page_ids"]]
+        pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, pred_internal_page_ids)
+        gold_corpus_ids = [str(corpus_id) for corpus_id in sample.get("gold_corpus_ids", sample.get("positive_corpus_ids", []))]
+        _validate_vidore_corpus_id_space(sample, pred_corpus_ids, gold_corpus_ids)
+        prediction = {
+            "qid": str(sample.get("query_id", sample.get("qid", ""))),
+            "query_id": str(sample.get("query_id", sample.get("qid", ""))),
+            "query": query_text,
+            "gold_corpus_ids": gold_corpus_ids,
+            "pred_corpus_ids": pred_corpus_ids,
+            "pred_scores": [float(score) for score in result.get("scores", [])[: len(pred_corpus_ids)]],
+            "topk": max_topk,
+        }
+        _assert_vidore_prediction_uses_corpus_ids(prediction)
+        predictions.append(prediction)
+        total_candidates += len(sample.get("candidates", []))
+        if sample_index < 3:
+            logger.info(
+                "[DEBUG] BM25ViDoRe sample %d: query_id=%s gold=%s pred_top10=%s top10_scores=%s hit@1=%s hit@5=%s hit@10=%s",
+                sample_index,
+                sample.get("query_id", sample.get("qid", "")),
+                gold_corpus_ids[:10],
+                pred_corpus_ids[:10],
+                prediction["pred_scores"][:10],
+                bool(set(gold_corpus_ids) & set(pred_corpus_ids[:1])),
+                bool(set(gold_corpus_ids) & set(pred_corpus_ids[:5])),
+                bool(set(gold_corpus_ids) & set(pred_corpus_ids[:10])),
+            )
+
+    runtime_seconds = float(time.perf_counter() - start_time)
+    labeled_predictions = [item for item in predictions if item.get("gold_corpus_ids")]
+    metrics = _evaluate_vidore_corpus_retrieval(labeled_predictions, configured_k_values) if labeled_predictions else {}
+    metrics["NDCG@10"] = _ndcg_corpus_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    sweep_rows: list[dict[str, Any]] = []
+    for cutoff in sweep_topks:
+        truncated = [
+            {
+                **item,
+                "pred_corpus_ids": list(item.get("pred_corpus_ids", [])[:cutoff]),
+                "pred_scores": list(item.get("pred_scores", [])[:cutoff]),
+            }
+            for item in labeled_predictions
+        ]
+        cutoff_metrics = _evaluate_vidore_corpus_retrieval(truncated, [cutoff]) if truncated else {}
+        mrr_at_k = sum(_vidore_corpus_mrr(item) for item in truncated) / len(truncated) if truncated else 0.0
+        sweep_rows.append(
+            {
+                "topk": int(cutoff),
+                f"Recall@{cutoff}": float(cutoff_metrics.get(f"Recall@{cutoff}", 0.0)),
+                f"Hit@{cutoff}": float(cutoff_metrics.get(f"Hit@{cutoff}", 0.0)),
+                "MRR": float(mrr_at_k),
+            }
+        )
+    metrics.update(
+        {
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_pages": len(candidates),
+            "avg_candidate_set_size": float(total_candidates / max(len(samples), 1)),
+            "id_space": "corpus_id",
+            "runtime_seconds": runtime_seconds,
+            "dataset_path": dataset_path,
+            "topk_runtime_note": (
+                "BM25 standalone runtime is dominated by scoring the full corpus per query; returned topk mainly "
+                "changes downstream retained candidates rather than BM25 scoring cost itself."
+            ),
+            "topk_sweep": sweep_rows,
+            **dataset_summary,
+        }
+    )
+    logger.info("BM25 ViDoRe Energy metrics: %s", metrics)
+    return predictions, metrics
+
+
+def run_bm25_600_nemotron_bge_vidore_energy_on_dataset(
+    cfg: Any,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+) -> tuple[list[dict], dict]:
+    """Run BM25@600 -> parallel Nemotron/BGE -> candidate union -> fusion MLP on ViDoRe Energy."""
+    logger = get_logger("bm25_600_nemotron_bge_vidore_energy_retrieval")
+    branch_cfg = getattr(cfg, "bm25_600_nemotron_bge_vidore_energy", {})
+    nemotron_cfg = cfg.visual_nemotron_energy
+    dataset_path = str(getattr(branch_cfg, "dataset_path", getattr(nemotron_cfg, "dataset_path", "")))
+    coarse_topk = int(getattr(branch_cfg, "coarse_topk", 600) or 600)
+    if coarse_topk != 600:
+        raise RuntimeError(
+            f"BM25-600 Nemotron+BGE branch requires coarse_topk=600, but got coarse_topk={coarse_topk}."
+        )
+    final_merge_strategy = str(getattr(branch_cfg, "final_merge_strategy", "adaptive_fusion_mlp"))
+    if final_merge_strategy != "adaptive_fusion_mlp":
+        raise ValueError(
+            f"Unsupported final_merge_strategy for bm25_600_nemotron_bge_vidore_energy: {final_merge_strategy}"
+        )
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    samples, dataset_summary = load_vidore_energy_dataset(dataset_path, max_samples=max_samples)
+    if not samples:
+        raise RuntimeError(f"ViDoRe Energy dual-branch evaluation found no samples: dataset_path={dataset_path}")
+
+    corpus_candidates = list(samples[0].get("candidates", []))
+    if not corpus_candidates:
+        raise RuntimeError("ViDoRe Energy dual-branch evaluation found no candidate pages in the corpus pool.")
+    corpus_page_ids = [int(candidate.get("page_id", index)) for index, candidate in enumerate(corpus_candidates)]
+    corpus_texts = [str(candidate.get("ocr_text", "") or candidate.get("markdown", "") or "") for candidate in corpus_candidates]
+    if not any(text.strip() for text in corpus_texts):
+        raise RuntimeError("ViDoRe Energy dual-branch evaluation found no usable corpus.markdown / ocr_text text.")
+
+    logger.info("Running BM25 coarse filter with top@600")
+    logger.info(
+        "Running BM25-600 Nemotron+BGE ViDoRe Energy retrieval. dataset=%s samples=%d visual_model=%s "
+        "ocr_backend=%s final_merge_strategy=%s",
+        dataset_path,
+        len(samples),
+        str(nemotron_cfg.model_name),
+        "ocr_page_bm25_bge_rerank",
+        final_merge_strategy,
+    )
+    logger.info("Running nemotron visual branch on BM25-filtered candidates")
+    logger.info("Running BGE OCR branch on BM25-filtered candidates")
+    logger.info("Final stage reuses candidate union + fusion MLP from adaptive_fusion_visual_nemotron_ocr_energy")
+    fusion_checkpoint = _resolve_visual_nemotron_fusion_checkpoint(
+        cfg,
+        str(getattr(branch_cfg, "fusion_checkpoint_path", "") or ""),
+    )
+    fusion_model = _load_adaptive_ablation_mlp_model_from_checkpoint(
+        cfg,
+        variant="visual_nemotron_ocr_energy",
+        checkpoint_path=fusion_checkpoint,
+        checkpoint_subdir="adaptive_fusion_visual_nemotron_ocr_energy",
+    )
+
+    bm25_retriever = BM25Retriever()
+    bm25_retriever.build_index(page_texts=corpus_texts, page_ids=corpus_page_ids)
+    candidate_by_page_id = {int(candidate["page_id"]): candidate for candidate in corpus_candidates}
+    page_text_by_id = {int(candidate["page_id"]): str(candidate.get("ocr_text", "") or candidate.get("markdown", "") or "") for candidate in corpus_candidates}
+
+    visual_retriever = NemotronVisualRetriever(
+        model_path=str(nemotron_cfg.model_name),
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    if not bool(getattr(nemotron_cfg, "enable_embedding_cache", True)):
+        logger.info("Nemotron embedding cache disabled; all page embeddings will be recomputed.")
+
+    ocr_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_doc_id = "__vidore_energy_full_corpus__"
+    semantic_topk = int(getattr(cfg.ocr_semantic_retrieval, "semantic_topk", 30) or 30)
+    rerank_topk = int(getattr(cfg.ocr_reranker, "rerank_topk", int(cfg.retrieval.topk)) or int(cfg.retrieval.topk))
+    ocr_indexed_docs: set[str] = set()
+    ocr_page_text_cache = {ocr_doc_id: list(corpus_texts)}
+    question_encoder = QuestionEncoder()
+    ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
+
+    if k_values is None:
+        k_values = [1, 5, 10]
+
+    predictions: list[dict[str, Any]] = []
+    total_candidates = 0
+    coarse_hits = {10: 0.0, 50: 0.0, 100: 0.0, 600: 0.0}
+    coarse_before_total = 0.0
+    coarse_after_total = 0.0
+    visual_runtime = 0.0
+    ocr_runtime = 0.0
+    fusion_runtime = 0.0
+    cache_stats: dict[str, Any] = {
+        "skipped_empty_candidates": 0,
+        "visual_embedding_cache_hits": 0,
+        "visual_embedding_cache_misses": 0,
+    }
+    start_time = time.perf_counter()
+
+    for sample_index, sample in enumerate(tqdm(samples, desc="BM25_600_Nemotron_BGE_ViDoReEnergy", unit="sample")):
+        query_text = _get_vidore_energy_query_text(sample)
+        gold_corpus_ids = [str(corpus_id) for corpus_id in sample.get("gold_corpus_ids", sample.get("positive_corpus_ids", []))]
+        coarse_before_total += float(len(corpus_candidates))
+        bm25_result = bm25_retriever.retrieve(query_text, topk=min(coarse_topk, len(corpus_candidates)))
+        bm25_page_ids = [int(page_id) for page_id in bm25_result.get("page_ids", [])]
+        expected_pool_size = min(coarse_topk, len(corpus_candidates))
+        if len(bm25_page_ids) != expected_pool_size:
+            raise RuntimeError(
+                f"BM25 candidate pool size mismatch for query_id={sample.get('query_id', sample.get('qid', ''))}: "
+                f"expected={expected_pool_size} actual={len(bm25_page_ids)}"
+            )
+        coarse_after_total += float(len(bm25_page_ids))
+        bm25_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, bm25_page_ids)
+        _validate_vidore_corpus_id_space(sample, bm25_corpus_ids, gold_corpus_ids)
+        for cutoff in coarse_hits:
+            if set(gold_corpus_ids) & set(bm25_corpus_ids[: min(cutoff, len(bm25_corpus_ids))]):
+                coarse_hits[cutoff] += 1.0
+
+        filtered_candidates = [candidate_by_page_id[page_id] for page_id in bm25_page_ids]
+        total_candidates += len(filtered_candidates)
+
+        visual_start = time.perf_counter()
+        before_hits = int(visual_retriever.cache_hits)
+        before_misses = int(visual_retriever.cache_misses)
+        visual_result = visual_retriever.retrieve(query_text, filtered_candidates, topk=len(filtered_candidates))
+        visual_runtime += float(time.perf_counter() - visual_start)
+        cache_stats["visual_embedding_cache_hits"] += int(visual_retriever.cache_hits - before_hits)
+        cache_stats["visual_embedding_cache_misses"] += int(visual_retriever.cache_misses - before_misses)
+        visual_pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, [int(page_id) for page_id in visual_result.get("page_ids", [])])
+
+        ocr_start = time.perf_counter()
+        ocr_subset_sample = {
+            "doc_id": ocr_doc_id,
+            "question": query_text,
+            "query": query_text,
+            "page_ids": list(corpus_page_ids),
+            "page_texts": list(corpus_texts),
+        }
+        ocr_result, ocr_stats = run_ocr_page_pipeline_for_subset(
+            cfg=cfg,
+            sample=ocr_subset_sample,
+            candidate_page_ids=bm25_page_ids,
+            topk=topk,
+            retriever=ocr_retriever,
+            indexed_docs=ocr_indexed_docs,
+            reranker=ocr_reranker,
+            page_text_cache=ocr_page_text_cache,
+            doc_id_override=ocr_doc_id,
+            query_text=query_text,
+            query_variant="raw_question",
+            semantic_topk=min(semantic_topk, len(bm25_page_ids)),
+            rerank_topk=min(rerank_topk, len(bm25_page_ids)),
+        )
+        ocr_runtime += float(time.perf_counter() - ocr_start)
+        ocr_pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, [int(page_id) for page_id in ocr_result.get("page_ids", [])])
+
+        fusion_start = time.perf_counter()
+        processed_sample = _vidore_energy_sample_to_processed_sample(sample)
+        subset_sample = dict(processed_sample)
+        subset_sample["page_ids"] = list(bm25_page_ids)
+        subset_sample["page_texts"] = [page_text_by_id.get(int(page_id), "") for page_id in bm25_page_ids]
+        subset_sample["page_id_to_corpus_id"] = {
+            str(page_id): str(processed_sample.get("page_id_to_corpus_id", {}).get(str(page_id), ""))
+            for page_id in bm25_page_ids
+            if str(page_id) in processed_sample.get("page_id_to_corpus_id", {})
+        }
+        candidate_rows = build_candidate_features_visual_colqwen_ocr_chunk(
+            subset_sample,
+            ocr_result,
+            visual_result,
+            ocr_page_texts=corpus_texts,
+            question_encoder=question_encoder,
+            ocr_quality_cache=ocr_quality_cache,
+        )
+        if not candidate_rows:
+            cache_stats["skipped_empty_candidates"] += 1
+            continue
+        ranked = fusion_model.rank_candidates(candidate_rows)
+        final_page_ids = [int(page_id) for page_id in ranked.get("page_ids", [])]
+        final_pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, final_page_ids)
+        final_scores = [float(score) for score in ranked.get("scores", [])[: len(final_pred_corpus_ids)]]
+        fusion_runtime += float(time.perf_counter() - fusion_start)
+
+        if final_scores and np.allclose(final_scores, final_scores[0]):
+            logger.warning(
+                "Dual-branch final scores are constant for query_id=%s; merge strategy=%s",
+                sample.get("query_id", sample.get("qid", "")),
+                final_merge_strategy,
+            )
+
+        prediction = {
+            "qid": str(sample.get("query_id", sample.get("qid", ""))),
+            "query_id": str(sample.get("query_id", sample.get("qid", ""))),
+            "doc_id": "vidore_v3_energy",
+            "query": query_text,
+            "gold_corpus_ids": gold_corpus_ids,
+            "pred_corpus_ids": final_pred_corpus_ids,
+            "pred_scores": final_scores,
+            "topk": int(topk),
+        }
+        _assert_vidore_prediction_uses_corpus_ids(prediction)
+        predictions.append(prediction)
+
+        if sample_index < 3:
+            logger.info(
+                "[DEBUG] DualBM25NemotronBGE sample %d: query_id=%s query_preview=%r gold=%s "
+                "bm25_top10=%s visual_top10=%s ocr_top10=%s final_top10=%s final_hit@10=%s",
+                sample_index,
+                sample.get("query_id", sample.get("qid", "")),
+                query_text[:200],
+                gold_corpus_ids[:10],
+                bm25_corpus_ids[:10],
+                visual_pred_corpus_ids[:10],
+                ocr_pred_corpus_ids[:10],
+                final_pred_corpus_ids[:10],
+                bool(set(gold_corpus_ids) & set(final_pred_corpus_ids[:10])),
+            )
+
+    runtime_seconds = float(time.perf_counter() - start_time)
+    visual_retriever.save_cache()
+    labeled_predictions = [item for item in predictions if item.get("gold_corpus_ids")]
+    metrics = _evaluate_vidore_corpus_retrieval(labeled_predictions, list(k_values)) if labeled_predictions else {}
+    metrics["NDCG@10"] = _ndcg_corpus_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    metrics.update(
+        {
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_pages": len(corpus_candidates),
+            "avg_candidate_set_size": float(total_candidates / max(len(samples), 1)),
+            "id_space": "corpus_id",
+            "runtime_seconds": runtime_seconds,
+            "bm25_runtime_seconds": float(runtime_seconds - visual_runtime - ocr_runtime - fusion_runtime),
+            "visual_runtime_seconds": float(visual_runtime),
+            "ocr_runtime_seconds": float(ocr_runtime),
+            "fusion_runtime_seconds": float(fusion_runtime),
+            "avg_num_pages_before_coarse": float(coarse_before_total / max(len(samples), 1)),
+            "avg_num_pages_after_coarse": float(coarse_after_total / max(len(samples), 1)),
+            "coarse_topk": int(coarse_topk),
+            "bm25_coarse_recall@10": float(coarse_hits[10] / max(len(samples), 1)),
+            "bm25_coarse_recall@50": float(coarse_hits[50] / max(len(samples), 1)),
+            "bm25_coarse_recall@100": float(coarse_hits[100] / max(len(samples), 1)),
+            "bm25_coarse_recall@600": float(coarse_hits[600] / max(len(samples), 1)),
+            "visual_model_path": str(nemotron_cfg.model_name),
+            "dataset_path": dataset_path,
+            "final_merge_strategy": final_merge_strategy,
+            "fusion_checkpoint_path": fusion_checkpoint,
+            **cache_stats,
+            **visual_retriever.cache_stats(),
+            **dataset_summary,
+        }
+    )
+    logger.info("Merging dual-branch candidates by corpus_id and scoring them with fusion MLP")
+    logger.info("BM25-600 Nemotron+BGE ViDoRe Energy metrics: %s", metrics)
+    return predictions, metrics
+
+
+def run_bm25_600_nemotron_bge_mpdocvqa_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run per-sample BM25@600 -> Nemotron/BGE -> RRF on MP-DocVQA canonical page ids."""
+    logger = get_logger("bm25_600_nemotron_bge_mpdocvqa_retrieval")
+    branch_cfg = getattr(cfg, "bm25_600_nemotron_bge_mpdocvqa", {})
+    nemotron_cfg = cfg.visual_nemotron_energy
+    coarse_topk = int(getattr(branch_cfg, "coarse_topk", 600) or 600)
+    if coarse_topk != 600:
+        raise RuntimeError(
+            f"BM25-600 Nemotron+BGE MP-DocVQA branch requires coarse_topk=600, but got coarse_topk={coarse_topk}."
+        )
+    final_merge_strategy = str(getattr(branch_cfg, "final_merge_strategy", "rrf"))
+    if final_merge_strategy != "rrf":
+        raise ValueError(
+            f"Unsupported final_merge_strategy for bm25_600_nemotron_bge_mpdocvqa: {final_merge_strategy}"
+        )
+    canonical_page_id_format = str(getattr(branch_cfg, "page_id_format", getattr(cfg.dataset, "page_id_template", "{doc_id}_p{page_index}")))
+    records = load_jsonl(dataset_path)
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    if max_samples > 0:
+        records = records[:max_samples]
+    if not records:
+        raise RuntimeError(f"MP-DocVQA evaluation found no processed samples: dataset_path={dataset_path}")
+
+    logger.info("Loaded MP-DocVQA dataset %s with %d samples", dataset_path, len(records))
+    logger.info("Using canonical page id format: %s", canonical_page_id_format)
+    logger.info("Running BM25 coarse filter with top@600")
+    logger.info(
+        "Running BM25-600 Nemotron+BGE MP-DocVQA retrieval. dataset=%s samples=%d visual_model=%s ocr_backend=%s final_merge_strategy=%s",
+        dataset_path,
+        len(records),
+        str(nemotron_cfg.model_name),
+        "ocr_page_bm25_bge_rerank",
+        final_merge_strategy,
+    )
+
+    visual_retriever = NemotronVisualRetriever(
+        model_path=str(nemotron_cfg.model_name),
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    ocr_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_indexed_docs: set[str] = set()
+    ocr_page_text_cache: dict[str, list[str]] = {}
+    if k_values is None:
+        k_values = [1, 5, 10]
+    k_values = sorted({int(k) for k in list(k_values) + [20, 50] if int(k) > 0})
+    rrf_k = int(getattr(branch_cfg, "rrf_k", getattr(cfg.fusion, "rrf_k", 60)) or 60)
+
+    predictions: list[dict[str, Any]] = []
+    runtime_start = time.perf_counter()
+    total_candidates = 0
+    coarse_before_total = 0.0
+    coarse_after_total = 0.0
+    coarse_hits = {10: 0.0, 50: 0.0, 100: 0.0, 600: 0.0}
+    visual_runtime = 0.0
+    ocr_runtime = 0.0
+    merge_runtime = 0.0
+    cache_stats: dict[str, Any] = {
+        "visual_embedding_cache_hits": 0,
+        "visual_embedding_cache_misses": 0,
+        "ocr_bge_embedding_cache_hits": 0,
+        "ocr_bge_embedding_cache_misses": 0,
+        "ocr_rerank_calls": 0,
+        "skipped_empty_candidates": 0,
+    }
+
+    for sample_index, sample in enumerate(tqdm(records, desc="BM25_600_Nemotron_BGE_MPDocVQA", unit="sample")):
+        candidates, page_texts, gold_page_ids, page_id_to_canonical = _build_mpdocvqa_candidate_pool(cfg, sample)
+        total_candidates += len(candidates)
+        coarse_before_total += float(len(candidates))
+        bm25_retriever = BM25Retriever()
+        bm25_retriever.build_index(page_texts=page_texts, page_ids=list(range(len(candidates))))
+        bm25_result = bm25_retriever.retrieve(str(sample["question"]), topk=min(coarse_topk, len(candidates)))
+        bm25_page_ids = [int(page_id) for page_id in bm25_result.get("page_ids", [])]
+        expected_pool_size = min(coarse_topk, len(candidates))
+        if len(candidates) > coarse_topk and len(bm25_page_ids) != coarse_topk:
+            raise RuntimeError(
+                f"BM25 candidate pool size mismatch for qid={sample.get('qid', '')}: expected={coarse_topk} actual={len(bm25_page_ids)}"
+            )
+        coarse_after_total += float(len(bm25_page_ids))
+        bm25_pred_page_ids = [page_id_to_canonical[int(page_id)] for page_id in bm25_page_ids]
+        _validate_mpdocvqa_page_id_space(sample, bm25_pred_page_ids, gold_page_ids, list(page_id_to_canonical.values()))
+        for cutoff in coarse_hits:
+            if set(gold_page_ids) & set(bm25_pred_page_ids[: min(cutoff, len(bm25_pred_page_ids))]):
+                coarse_hits[cutoff] += 1.0
+
+        filtered_candidates = [candidates[page_id] for page_id in bm25_page_ids]
+        if not filtered_candidates:
+            cache_stats["skipped_empty_candidates"] += 1
+            continue
+
+        visual_start = time.perf_counter()
+        before_hits = int(visual_retriever.cache_hits)
+        before_misses = int(visual_retriever.cache_misses)
+        visual_result = visual_retriever.retrieve(str(sample["question"]), filtered_candidates, topk=len(filtered_candidates))
+        visual_runtime += float(time.perf_counter() - visual_start)
+        cache_stats["visual_embedding_cache_hits"] += int(visual_retriever.cache_hits - before_hits)
+        cache_stats["visual_embedding_cache_misses"] += int(visual_retriever.cache_misses - before_misses)
+        visual_pred_page_ids = [page_id_to_canonical[int(page_id)] for page_id in visual_result.get("page_ids", [])]
+
+        ocr_start = time.perf_counter()
+        ocr_sample = dict(sample)
+        ocr_sample["page_ids"] = list(range(len(candidates)))
+        ocr_sample["page_texts"] = list(page_texts)
+        ocr_result, ocr_stats = run_ocr_page_pipeline_for_subset(
+            cfg=cfg,
+            sample=ocr_sample,
+            candidate_page_ids=bm25_page_ids,
+            topk=topk,
+            retriever=ocr_retriever,
+            indexed_docs=ocr_indexed_docs,
+            reranker=ocr_reranker,
+            page_text_cache=ocr_page_text_cache,
+            query_text=str(sample["question"]),
+            query_variant="raw_question",
+            semantic_topk=min(int(getattr(cfg.ocr_semantic_retrieval, "semantic_topk", 30) or 30), len(bm25_page_ids)),
+            rerank_topk=min(int(getattr(cfg.ocr_reranker, "rerank_topk", topk) or topk), len(bm25_page_ids)),
+        )
+        ocr_runtime += float(time.perf_counter() - ocr_start)
+        cache_stats["ocr_bge_embedding_cache_hits"] += int(ocr_stats.get("ocr_bge_embedding_cache_hits", 0))
+        cache_stats["ocr_bge_embedding_cache_misses"] += int(ocr_stats.get("ocr_bge_embedding_cache_misses", 0))
+        cache_stats["ocr_rerank_calls"] += int(ocr_stats.get("ocr_rerank_calls", 0))
+        ocr_pred_page_ids = [page_id_to_canonical[int(page_id)] for page_id in ocr_result.get("page_ids", [])]
+
+        merge_start = time.perf_counter()
+        final_pred_page_ids, final_scores = _merge_page_rankings_with_rrf(
+            visual_pred_page_ids=visual_pred_page_ids,
+            visual_scores=[float(score) for score in visual_result.get("scores", [])],
+            ocr_pred_page_ids=ocr_pred_page_ids,
+            ocr_scores=[float(score) for score in ocr_result.get("scores", [])],
+            rrf_k=rrf_k,
+        )
+        merge_runtime += float(time.perf_counter() - merge_start)
+        _validate_mpdocvqa_page_id_space(sample, final_pred_page_ids, gold_page_ids, list(page_id_to_canonical.values()))
+        if final_scores and np.allclose(final_scores, final_scores[0]):
+            logger.warning("MP-DocVQA final merged scores are constant for qid=%s", sample.get("qid", ""))
+
+        prediction = {
+            "qid": str(sample.get("qid", "")),
+            "doc_id": str(sample.get("doc_id", "")),
+            "question": str(sample.get("question", "")),
+            "gold_page_ids": list(gold_page_ids),
+            "pred_page_ids": list(final_pred_page_ids[: max(k_values)]),
+            "pred_scores": [float(score) for score in final_scores[: max(k_values)]],
+            "topk": int(topk),
+        }
+        predictions.append(prediction)
+
+        if sample_index < 3:
+            logger.info(
+                "[DEBUG] DualBM25NemotronBGEMPDocVQA sample %d: qid=%s doc_id=%s question_preview=%r gold=%s bm25_top10=%s visual_top10=%s ocr_top10=%s final_top10=%s final_hit@10=%s",
+                sample_index,
+                sample.get("qid", ""),
+                sample.get("doc_id", ""),
+                str(sample.get("question", ""))[:200],
+                gold_page_ids[:10],
+                bm25_pred_page_ids[:10],
+                visual_pred_page_ids[:10],
+                ocr_pred_page_ids[:10],
+                final_pred_page_ids[:10],
+                bool(set(gold_page_ids) & set(final_pred_page_ids[:10])),
+            )
+
+    visual_retriever.save_cache()
+    total_runtime = float(time.perf_counter() - runtime_start)
+    labeled_predictions = [item for item in predictions if item.get("gold_page_ids")]
+    metrics = _evaluate_mpdocvqa_page_retrieval(labeled_predictions, k_values) if labeled_predictions else {}
+    metrics["nDCG@5"] = _ndcg_page_id_at_k(labeled_predictions, k=5) if labeled_predictions else 0.0
+    metrics["nDCG@10"] = _ndcg_page_id_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    metrics["nDCG@20"] = _ndcg_page_id_at_k(labeled_predictions, k=20) if labeled_predictions else 0.0
+    metrics.update(
+        {
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_docs": len({str(item.get("doc_id", "")) for item in records}),
+            "num_unique_pages": int(sum(len(item.get("image_paths", [])) for item in records)),
+            "avg_candidate_set_size": float(total_candidates / max(len(records), 1)),
+            "id_space": canonical_page_id_format,
+            "id_space_description": "canonical MP-DocVQA page ids derived from dataset.page_id_template",
+            "runtime_seconds": total_runtime,
+            "bm25_runtime_seconds": max(0.0, total_runtime - visual_runtime - ocr_runtime - merge_runtime),
+            "visual_runtime_seconds": float(visual_runtime),
+            "ocr_runtime_seconds": float(ocr_runtime),
+            "merge_runtime_seconds": float(merge_runtime),
+            "avg_num_pages_before_coarse": float(coarse_before_total / max(len(records), 1)),
+            "avg_num_pages_after_coarse": float(coarse_after_total / max(len(records), 1)),
+            "coarse_topk": int(coarse_topk),
+            "bm25_coarse_recall@10": float(coarse_hits[10] / max(len(records), 1)),
+            "bm25_coarse_recall@50": float(coarse_hits[50] / max(len(records), 1)),
+            "bm25_coarse_recall@100": float(coarse_hits[100] / max(len(records), 1)),
+            "bm25_coarse_recall@600": float(coarse_hits[600] / max(len(records), 1)),
+            "dataset_path": dataset_path,
+            "visual_model_path": str(nemotron_cfg.model_name),
+            "ocr_backend": "ocr_page_bm25_bge_rerank",
+            "final_merge_strategy": final_merge_strategy,
+            "rrf_k": int(rrf_k),
+            **cache_stats,
+        }
+    )
+    logger.info("Merging dual-branch candidates by canonical page_id")
+    logger.info("BM25-600 Nemotron+BGE MP-DocVQA metrics: %s", metrics)
+    return predictions, metrics
+
+
+def run_visual_nemotron_mpdocvqa_on_dataset(
+    cfg: Any,
+    dataset_path: str,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run pure visual-only Nemotron retrieval on MP-DocVQA canonical page ids."""
+    logger = get_logger("visual_nemotron_mpdocvqa_retrieval")
+    branch_cfg = getattr(cfg, "visual_nemotron_mpdocvqa", {})
+    nemotron_cfg = cfg.visual_nemotron_energy
+    canonical_page_id_format = str(getattr(branch_cfg, "page_id_format", getattr(cfg.dataset, "page_id_template", "{doc_id}_p{page_index}")))
+    records = load_jsonl(dataset_path)
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    if max_samples > 0:
+        records = records[:max_samples]
+    if not records:
+        raise RuntimeError(f"MP-DocVQA visual-only evaluation found no processed samples: dataset_path={dataset_path}")
+
+    logger.info("Loaded MP-DocVQA dataset %s with %d samples", dataset_path, len(records))
+    logger.info("Using canonical page id format: %s", canonical_page_id_format)
+    logger.info(
+        "Running visual-only nemotron retrieval on MP-DocVQA. model=%s device=%s samples=%d",
+        str(nemotron_cfg.model_name),
+        str(nemotron_cfg.device),
+        len(records),
+    )
+
+    visual_retriever = NemotronVisualRetriever(
+        model_path=str(nemotron_cfg.model_name),
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+
+    if k_values is None:
+        k_values = [1, 5, 10]
+    k_values = sorted({int(k) for k in list(k_values) + [20] if int(k) > 0})
+
+    predictions: list[dict[str, Any]] = []
+    runtime_start = time.perf_counter()
+    total_candidates = 0
+    cache_stats: dict[str, Any] = {
+        "visual_embedding_cache_hits": 0,
+        "visual_embedding_cache_misses": 0,
+        "constant_score_samples": 0,
+    }
+
+    for sample_index, sample in enumerate(tqdm(records, desc="VisualNemotronMPDocVQA", unit="sample")):
+        candidates, _page_texts, gold_page_ids, page_id_to_canonical = _build_mpdocvqa_candidate_pool(cfg, sample)
+        total_candidates += len(candidates)
+        before_hits = int(visual_retriever.cache_hits)
+        before_misses = int(visual_retriever.cache_misses)
+        result = visual_retriever.retrieve(str(sample["question"]), candidates, topk=len(candidates))
+        cache_stats["visual_embedding_cache_hits"] += int(visual_retriever.cache_hits - before_hits)
+        cache_stats["visual_embedding_cache_misses"] += int(visual_retriever.cache_misses - before_misses)
+
+        pred_page_ids = [page_id_to_canonical[int(page_id)] for page_id in result.get("page_ids", [])]
+        pred_scores = [float(score) for score in result.get("scores", [])[: len(pred_page_ids)]]
+        _validate_mpdocvqa_page_id_space(sample, pred_page_ids, gold_page_ids, list(page_id_to_canonical.values()))
+        if pred_scores and np.allclose(pred_scores, pred_scores[0]):
+            cache_stats["constant_score_samples"] += 1
+            logger.warning("MP-DocVQA visual-only scores are constant for qid=%s", sample.get("qid", ""))
+
+        prediction = {
+            "qid": str(sample.get("qid", "")),
+            "doc_id": str(sample.get("doc_id", "")),
+            "question": str(sample.get("question", "")),
+            "gold_page_ids": list(gold_page_ids),
+            "pred_page_ids": list(pred_page_ids[: max(k_values)]),
+            "pred_scores": list(pred_scores[: max(k_values)]),
+            "topk": int(topk),
+        }
+        predictions.append(prediction)
+
+        if sample_index < 3:
+            logger.info(
+                "[DEBUG] VisualNemotronMPDocVQA sample %d: qid=%s doc_id=%s question_preview=%r gold=%s pred_top10=%s top10_scores=%s final_hit@10=%s",
+                sample_index,
+                sample.get("qid", ""),
+                sample.get("doc_id", ""),
+                str(sample.get("question", ""))[:200],
+                gold_page_ids[:10],
+                pred_page_ids[:10],
+                pred_scores[:10],
+                bool(set(gold_page_ids) & set(pred_page_ids[:10])),
+            )
+
+    visual_retriever.save_cache()
+    total_runtime = float(time.perf_counter() - runtime_start)
+    labeled_predictions = [item for item in predictions if item.get("gold_page_ids")]
+    metrics = _evaluate_mpdocvqa_page_retrieval(labeled_predictions, k_values) if labeled_predictions else {}
+    metrics["nDCG@5"] = _ndcg_page_id_at_k(labeled_predictions, k=5) if labeled_predictions else 0.0
+    metrics["nDCG@10"] = _ndcg_page_id_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    metrics["nDCG@20"] = _ndcg_page_id_at_k(labeled_predictions, k=20) if labeled_predictions else 0.0
+    metrics.update(
+        {
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_docs": len({str(item.get("doc_id", "")) for item in records}),
+            "num_unique_pages": int(sum(len(item.get("image_paths", [])) for item in records)),
+            "avg_candidate_set_size": float(total_candidates / max(len(records), 1)),
+            "id_space": canonical_page_id_format,
+            "id_space_description": "canonical MP-DocVQA page ids derived from dataset.page_id_template",
+            "runtime_seconds": total_runtime,
+            "model_path": str(nemotron_cfg.model_name),
+            "dataset_path": dataset_path,
+            **cache_stats,
+            **visual_retriever.cache_stats(),
+        }
+    )
+    logger.info("Visual nemotron MP-DocVQA metrics: %s", metrics)
+    return predictions, metrics
+
+
+def run_visual_nemotron_energy_sanity_check(
+    cfg: Any,
+    num_samples: int = 3,
+    num_negatives: int = 9,
+) -> tuple[list[dict], dict]:
+    """Run a tiny deterministic corpus_id-space sanity check for Nemotron visual retrieval."""
+    logger = get_logger("visual_nemotron_energy_sanity")
+    nemotron_cfg = cfg.visual_nemotron_energy
+    samples, dataset_summary = load_vidore_energy_dataset(str(nemotron_cfg.dataset_path), max_samples=0)
+    retriever = NemotronVisualRetriever(
+        model_path=str(nemotron_cfg.model_name),
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    sanity_predictions: list[dict] = []
+    for sample_index, sample in enumerate(samples[:num_samples]):
+        query_text = _get_vidore_energy_query_text(sample)
+        candidates = list(sample.get("candidates", []))
+        positives = [str(corpus_id) for corpus_id in sample.get("positive_corpus_ids", [])]
+        if not positives:
+            raise RuntimeError(f"ViDoRe sanity sample has no positive_corpus_ids: query_id={sample.get('query_id')}")
+        positive_id = positives[0]
+        positive_candidates = [candidate for candidate in candidates if str(candidate.get("corpus_id")) == positive_id]
+        negative_candidates = [
+            candidate for candidate in candidates if str(candidate.get("corpus_id")) not in set(positives)
+        ][:num_negatives]
+        tiny_candidates = positive_candidates[:1] + negative_candidates
+        if len(tiny_candidates) <= 1:
+            raise RuntimeError(f"ViDoRe sanity sample has insufficient negatives: query_id={sample.get('query_id')}")
+        result = retriever.retrieve(query_text, tiny_candidates, topk=len(tiny_candidates))
+        pred_internal_page_ids = [int(page_id) for page_id in result["page_ids"]]
+        pred_corpus_ids = _map_vidore_page_ids_to_corpus_ids(sample, pred_internal_page_ids)
+        scores_by_corpus_id = {
+            corpus_id: float(score) for corpus_id, score in zip(pred_corpus_ids, result["scores"], strict=False)
+        }
+        logger.info(
+            "Nemotron sanity sample %d: query_id=%s query=%r gold_corpus_id=%s candidate_corpus_ids=%s ranked_corpus_ids=%s scores=%s",
+            sample_index,
+            sample.get("query_id", sample.get("qid", "")),
+            query_text[:200],
+            positive_id,
+            [str(candidate.get("corpus_id")) for candidate in tiny_candidates],
+            pred_corpus_ids,
+            [float(score) for score in result["scores"]],
+        )
+        sanity_predictions.append(
+            {
+                "qid": sample.get("qid", sample.get("query_id", "")),
+                "query": query_text,
+                "gold_corpus_ids": [positive_id],
+                "pred_corpus_ids": pred_corpus_ids,
+                "pred_scores": [float(score) for score in result["scores"]],
+                "scores_by_corpus_id": scores_by_corpus_id,
+                "gold_in_top1": bool(pred_corpus_ids and pred_corpus_ids[0] == positive_id),
+                "gold_in_top10": positive_id in pred_corpus_ids[:10],
+            }
+        )
+    retriever.save_cache()
+    metrics = _evaluate_vidore_corpus_retrieval(sanity_predictions, [1, 5, 10]) if sanity_predictions else {}
+    metrics.update(
+        {
+            "stage_name": "visual_nemotron_energy_sanity",
+            "id_space": "corpus_id",
+            "num_sanity_samples": len(sanity_predictions),
+            "num_negatives_per_sample": int(num_negatives),
+            "dataset_path": str(nemotron_cfg.dataset_path),
+            "model_path": str(nemotron_cfg.model_name),
+            "dataset_summary": dataset_summary,
+            **retriever.cache_stats(),
+        }
+    )
+    logger.info("Visual nemotron sanity metrics: %s", metrics)
+    return sanity_predictions, metrics
+
+
+def run_adaptive_fusion_visual_nemotron_ocr_energy_on_dataset(
+    cfg: Any,
+    topk: int = 10,
+    k_values: list[int] | None = None,
+    checkpoint_path: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Run visual_nemotron + existing OCR page route + stable adaptive-fusion MLP on ViDoRe Energy."""
+    logger = get_logger("adaptive_fusion_visual_nemotron_ocr_energy_retrieval")
+    nemotron_cfg = cfg.visual_nemotron_energy
+    dataset_path = str(nemotron_cfg.dataset_path)
+    model_path = str(nemotron_cfg.model_name)
+    max_samples = int(getattr(cfg.training, "max_val_samples", 0) or 0)
+    samples, dataset_summary = load_vidore_energy_dataset(dataset_path, max_samples=max_samples)
+    logger.info(
+        "Running adaptive fusion visual_nemotron_ocr_energy. model=%s dataset=%s device=%s samples=%d topk=%d",
+        model_path,
+        dataset_path,
+        str(nemotron_cfg.device),
+        len(samples),
+        topk,
+    )
+    logger.info(
+        "OCR branch reused unchanged: backend=%s page_coarse=%s bm25_coarse=%s semantic_topk=%s rerank_topk=%s",
+        "ocr_page_bm25_bge_rerank",
+        bool(getattr(cfg.ocr_router, "enable_ocr_page_coarse", False)),
+        bool(getattr(cfg.ocr_router, "enable_bm25_coarse", True)),
+        int(getattr(cfg.ocr_semantic_retrieval, "semantic_topk", 0) or 0),
+        int(getattr(cfg.ocr_reranker, "rerank_topk", 0) or 0),
+    )
+
+    fusion_checkpoint = _resolve_visual_nemotron_fusion_checkpoint(cfg, checkpoint_path)
+    model = _load_adaptive_ablation_mlp_model_from_checkpoint(
+        cfg,
+        variant="visual_nemotron_ocr_energy",
+        checkpoint_path=fusion_checkpoint,
+        checkpoint_subdir="adaptive_fusion_visual_nemotron_ocr_energy",
+    )
+    question_encoder = QuestionEncoder()
+    ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
+    visual_retriever = NemotronVisualRetriever(
+        model_path=model_path,
+        device=str(nemotron_cfg.device),
+        local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
+        cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
+        batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+    )
+    if not bool(getattr(nemotron_cfg, "enable_embedding_cache", True)):
+        logger.info("Nemotron embedding cache disabled; all page embeddings will be recomputed.")
+    ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
+    ocr_page_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
+    ocr_indexed_docs: set[str] = set()
+    ocr_coarse_doc_text_cache: dict[str, list[str]] = {}
+    ocr_coarse_doc_retriever_cache: dict[str, Any] = {}
+    ocr_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="ocr_router", stats_prefix="ocr_bm25")
+    ocr_page_pipeline_stats = _build_ocr_page_pipeline_metric_accumulator()
+    predictions: list[dict] = []
+    cache_stats: dict[str, Any] = {
+        "skipped_empty_candidates": 0,
+        "visual_embedding_cache_hits": 0,
+        "visual_embedding_cache_misses": 0,
+    }
+    total_candidates = 0
+    start_time = time.perf_counter()
+
+    for raw_sample in tqdm(samples, desc="FusionNemotronEnergy", unit="sample"):
+        sample = _vidore_energy_sample_to_processed_sample(raw_sample)
+        total_candidates += len(raw_sample.get("candidates", []))
+        visual_result, visual_stats = _retrieve_visual_nemotron_energy_for_sample(
+            sample=raw_sample,
+            retriever=visual_retriever,
+        )
+        cache_stats["visual_embedding_cache_hits"] += int(visual_stats.get("embedding_cache_hits", 0))
+        cache_stats["visual_embedding_cache_misses"] += int(visual_stats.get("embedding_cache_misses", 0))
+
+        ocr_result, ocr_stats = _retrieve_ocr_with_bm25_bge_reranker_for_sample(
+            cfg=cfg,
+            sample=sample,
+            topk=topk,
+            retriever=ocr_page_retriever,
+            indexed_docs=ocr_indexed_docs,
+            reranker=ocr_page_reranker,
+            bm25_doc_text_cache=ocr_coarse_doc_text_cache,
+            bm25_doc_retriever_cache=ocr_coarse_doc_retriever_cache,
+        )
+        _accumulate_adaptive_coarse_metrics(ocr_coarse_stats, ocr_stats, stats_prefix="ocr_bm25")
+        _accumulate_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, ocr_stats)
+        for key, value in ocr_stats.items():
+            if key in ocr_coarse_stats or key in ocr_page_pipeline_stats:
+                continue
+            cache_stats[key] = cache_stats.get(key, 0) + value
+
+        candidate_rows = build_candidate_features_visual_colqwen_ocr_chunk(
+            sample,
+            ocr_result,
+            visual_result,
+            ocr_page_texts=ocr_coarse_doc_text_cache.get(str(sample["doc_id"])),
+            question_encoder=question_encoder,
+            ocr_quality_cache=ocr_quality_cache,
+        )
+        if not candidate_rows:
+            cache_stats["skipped_empty_candidates"] += 1
+            continue
+        ranked = model.rank_candidates(candidate_rows)
+        predictions.append(
+            {
+                "qid": sample["qid"],
+                "doc_id": sample["doc_id"],
+                "question": sample["question"],
+                "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
+                "pred_page_ids": [int(page_id) for page_id in ranked["page_ids"][:topk]],
+                "pred_scores": [float(score) for score in ranked["scores"][:topk]],
+                "topk": topk,
+            }
+        )
+
+    visual_retriever.save_cache()
+    if k_values is None:
+        k_values = [1, 5, 10]
+    labeled_predictions = [item for item in predictions if item.get("evidence_pages")]
+    metrics = evaluate_retrieval(labeled_predictions, k_values) if labeled_predictions else {}
+    metrics["NDCG@10"] = _ndcg_at_k(labeled_predictions, k=10) if labeled_predictions else 0.0
+    metrics.update(
+        {
+            "stage_name": "adaptive_fusion_visual_nemotron_ocr_energy",
+            "visual_backend": "nemotron-colembed-vl-8b-v2",
+            "ocr_backend": "ocr_page_bm25_bge_rerank",
+            "num_samples": len(predictions),
+            "num_loaded_samples": len(samples),
+            "num_labeled_samples": len(labeled_predictions),
+            "num_unique_pages": int(dataset_summary.get("num_candidate_images", 0)),
+            "avg_candidate_set_size": float(total_candidates / max(len(samples), 1)),
+            "runtime_seconds": time.perf_counter() - start_time,
+            "model_path": model_path,
+            "dataset_path": dataset_path,
+            "fusion_checkpoint_path": fusion_checkpoint,
+            **cache_stats,
+            **visual_retriever.cache_stats(),
+        }
+    )
+    metrics.update(summarize_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, len(samples)))
+    metrics.update(add_ocr_bm25_metric_aliases(summarize_adaptive_coarse_stats(ocr_coarse_stats, len(samples), stats_prefix="ocr_bm25")))
+    logger.info("ViDoRe Energy dataset summary: %s", dataset_summary)
+    logger.info("Adaptive fusion visual_nemotron_ocr_energy metrics: %s", metrics)
+    return predictions, metrics
+
+
+def _get_vidore_energy_query_text(sample: dict[str, Any]) -> str:
+    """Return canonical ViDoRe query text, prioritizing queries.query over legacy question."""
+    query_text = str(sample.get("query", "") or "").strip()
+    if not query_text:
+        query_text = str(sample.get("question", "") or "").strip()
+    if not query_text:
+        raise RuntimeError(
+            "ViDoRe Energy sample has empty query text. "
+            f"query_id={sample.get('query_id', sample.get('qid', ''))}"
+        )
+    return query_text
+
+
+def _map_vidore_page_ids_to_corpus_ids(sample: dict[str, Any], page_ids: list[int]) -> list[str]:
+    """Map internal integer page_ids back to canonical ViDoRe corpus_id strings."""
+    page_id_to_corpus_id = {str(key): str(value) for key, value in dict(sample.get("page_id_to_corpus_id", {})).items()}
+    if not page_id_to_corpus_id:
+        page_id_to_corpus_id = {
+            str(candidate.get("page_id")): str(candidate.get("corpus_id"))
+            for candidate in sample.get("candidates", [])
+            if candidate.get("page_id") is not None and candidate.get("corpus_id") is not None
+        }
+    corpus_ids: list[str] = []
+    missing_page_ids: list[int] = []
+    for page_id in page_ids:
+        corpus_id = page_id_to_corpus_id.get(str(int(page_id)))
+        if corpus_id is None or corpus_id == "":
+            missing_page_ids.append(int(page_id))
+            continue
+        corpus_ids.append(corpus_id)
+    if missing_page_ids:
+        raise RuntimeError(
+            "ViDoRe Energy prediction id-space mismatch: internal page_id cannot be mapped to corpus_id. "
+            f"query_id={sample.get('query_id', sample.get('qid', ''))} missing_page_ids={missing_page_ids[:10]}"
+        )
+    return corpus_ids
+
+
+def _validate_vidore_corpus_id_space(
+    sample: dict[str, Any],
+    pred_corpus_ids: list[str],
+    gold_corpus_ids: list[str],
+) -> None:
+    """Fail fast when ViDoRe predictions/gold labels are not in corpus_id space."""
+    logger = get_logger("visual_nemotron_energy_retrieval")
+    if not gold_corpus_ids:
+        raise RuntimeError(f"ViDoRe Energy sample has no gold_corpus_ids: query_id={sample.get('query_id', sample.get('qid', ''))}")
+    candidate_corpus_ids = {str(candidate.get("corpus_id")) for candidate in sample.get("candidates", [])}
+    unknown_gold = [corpus_id for corpus_id in gold_corpus_ids if corpus_id not in candidate_corpus_ids]
+    unknown_pred = [corpus_id for corpus_id in pred_corpus_ids if corpus_id not in candidate_corpus_ids]
+    if unknown_gold:
+        logger.warning(
+            "ViDoRe Energy gold corpus_id not found in candidate pool. query_id=%s unknown_gold=%s",
+            sample.get("query_id", sample.get("qid", "")),
+            unknown_gold[:10],
+        )
+    if unknown_pred:
+        raise RuntimeError(
+            "ViDoRe Energy corpus_id alignment failed. "
+            f"query_id={sample.get('query_id', sample.get('qid', ''))} "
+            f"unknown_pred={unknown_pred[:10]}"
+        )
+
+
+def _assert_vidore_prediction_uses_corpus_ids(prediction: dict[str, Any]) -> None:
+    """Forbid legacy page-id fields in ViDoRe Energy visual-only predictions."""
+    forbidden_keys = {"pred_page_ids", "evidence_pages", "pred_internal_page_ids", "evidence_internal_page_ids"}
+    present = sorted(key for key in forbidden_keys if key in prediction)
+    if present:
+        raise RuntimeError(f"Do not use page_id in ViDoRe evaluation. Forbidden prediction keys: {present}")
+    if not prediction.get("pred_corpus_ids") or not prediction.get("gold_corpus_ids"):
+        raise RuntimeError("ViDoRe Energy prediction must contain pred_corpus_ids and gold_corpus_ids.")
+
+
+def _evaluate_vidore_corpus_retrieval(predictions: list[dict[str, Any]], k_values: list[int]) -> dict[str, float]:
+    """Compute ViDoRe Energy metrics strictly in corpus_id space."""
+    if not predictions:
+        return {}
+    metrics: dict[str, float] = {}
+    for k in k_values:
+        metrics[f"Recall@{k}"] = sum(
+            float(bool(set(map(str, item["pred_corpus_ids"][:k])) & set(map(str, item["gold_corpus_ids"]))))
+            for item in predictions
+        ) / len(predictions)
+        metrics[f"Hit@{k}"] = metrics[f"Recall@{k}"]
+    metrics["MRR"] = sum(_vidore_corpus_mrr(item) for item in predictions) / len(predictions)
+    metrics["PageAcc"] = sum(
+        float(bool(item.get("pred_corpus_ids")) and str(item["pred_corpus_ids"][0]) in set(map(str, item["gold_corpus_ids"])))
+        for item in predictions
+    ) / len(predictions)
+    metrics["num_samples"] = len(predictions)
+    return metrics
+
+
+def _vidore_corpus_mrr(item: dict[str, Any]) -> float:
+    gold = set(map(str, item.get("gold_corpus_ids", [])))
+    for rank, corpus_id in enumerate(item.get("pred_corpus_ids", []), start=1):
+        if str(corpus_id) in gold:
+            return 1.0 / float(rank)
+    return 0.0
+
+
+def _log_visual_nemotron_debug_sample(
+    logger: Any,
+    sample_index: int,
+    sample: dict[str, Any],
+    query_text: str,
+    result: dict[str, Any],
+    pred_corpus_ids: list[str],
+    gold_corpus_ids: list[str],
+    candidates: list[dict[str, Any]],
+) -> None:
+    """Branch-local diagnostics for the first few ViDoRe Nemotron visual samples."""
+    candidate_example = candidates[0] if candidates else {}
+    image_info = _describe_vidore_candidate_image(candidate_example)
+    top_scores = [float(score) for score in result.get("scores", [])[:10]]
+    logger.info(
+        "VisualNemotron debug sample %d: query_id=%s query_preview=%r query_len=%d query_empty=%s",
+        sample_index,
+        sample.get("query_id", sample.get("qid", "")),
+        query_text[:200],
+        len(query_text),
+        not bool(query_text),
+    )
+    logger.info(
+        "[DEBUG] VisualNemotron ids sample %d: query_id=%s gold=%s pred=%s hit@1=%s hit@5=%s hit@10=%s "
+        "top10_scores=%s internal_top10_page_ids=%s page_id_to_corpus_id_preview=%s",
+        sample_index,
+        sample.get("query_id", sample.get("qid", "")),
+        gold_corpus_ids[:10],
+        pred_corpus_ids[:10],
+        bool(set(gold_corpus_ids) & set(pred_corpus_ids[:1])),
+        bool(set(gold_corpus_ids) & set(pred_corpus_ids[:5])),
+        bool(set(gold_corpus_ids) & set(pred_corpus_ids[:10])),
+        top_scores,
+        [int(page_id) for page_id in result.get("page_ids", [])[:10]],
+        list(dict(sample.get("page_id_to_corpus_id", {})).items())[:5],
+    )
+    logger.info(
+        "VisualNemotron debug image sample %d: corpus_id=%s page_id=%s image_source=%s image_info=%s",
+        sample_index,
+        candidate_example.get("corpus_id", ""),
+        candidate_example.get("page_id", ""),
+        candidate_example.get("image_source_type", ""),
+        image_info,
+    )
+
+
+def _describe_vidore_candidate_image(candidate: dict[str, Any]) -> dict[str, Any]:
+    image = candidate.get("image")
+    if image is not None:
+        return {
+            "input_type": type(image).__name__,
+            "is_pil": image.__class__.__module__.startswith("PIL."),
+            "mode": str(getattr(image, "mode", "")),
+            "size": tuple(getattr(image, "size", ())),
+        }
+    image_path = candidate.get("image_path")
+    info: dict[str, Any] = {
+        "input_type": "path",
+        "image_path": str(image_path or ""),
+        "path_exists": bool(Path(str(image_path)).exists()) if image_path else False,
+    }
+    if image_path:
+        try:
+            from PIL import Image
+
+            with Image.open(str(image_path)) as loaded:
+                info["mode"] = str(loaded.mode)
+                info["size"] = tuple(loaded.size)
+        except Exception as exc:
+            info["open_error"] = str(exc)
+    return info
+
+
+def _retrieve_visual_nemotron_energy_for_sample(
+    sample: dict[str, Any],
+    retriever: NemotronVisualRetriever,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Run Nemotron visual retrieval over all local ViDoRe Energy candidate images."""
+    candidates = list(sample.get("candidates", []))
+    before_hits = retriever.cache_hits
+    before_misses = retriever.cache_misses
+    result = retriever.retrieve(_get_vidore_energy_query_text(sample), candidates, topk=len(candidates))
+    result["visual_backend"] = "nemotron-colembed-vl-8b-v2"
+    return result, {
+        "embedding_cache_hits": int(retriever.cache_hits - before_hits),
+        "embedding_cache_misses": int(retriever.cache_misses - before_misses),
+    }
+
+
+def _vidore_energy_sample_to_processed_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    """Map local ViDoRe Energy loader samples into the processed-sample shape used by OCR/fusion helpers."""
+    candidates = list(sample.get("candidates", []))
+    page_ids = [int(candidate.get("page_id", index)) for index, candidate in enumerate(candidates)]
+    image_paths: list[str] = []
+    for index, candidate in enumerate(candidates):
+        image_path = candidate.get("image_path")
+        if image_path:
+            image_paths.append(str(image_path))
+        else:
+            image_paths.append(f"vidore_energy_{sample.get('qid', 'query')}_p{page_ids[index]}.jpg")
+    qid = str(sample.get("qid", "vidore_energy"))
+    page_texts = [str(candidate.get("ocr_text", "") or "") for candidate in candidates]
+    return {
+        "qid": qid,
+        "doc_id": f"vidore_energy:{qid}",
+        "query": _get_vidore_energy_query_text(sample),
+        "question": _get_vidore_energy_query_text(sample),
+        "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
+        "positive_corpus_ids": [str(corpus_id) for corpus_id in sample.get("positive_corpus_ids", [])],
+        "page_id_to_corpus_id": dict(sample.get("page_id_to_corpus_id", {})),
+        "image_paths": image_paths,
+        "ocr_paths": [],
+        "page_texts": page_texts,
+        "page_ids": page_ids,
+    }
+
+
+def _resolve_visual_nemotron_fusion_checkpoint(cfg: Any, checkpoint_path: str | None) -> str:
+    """Resolve the fusion checkpoint for the isolated Nemotron visual experiment branch."""
+    if checkpoint_path:
+        return str(checkpoint_path)
+    branch_checkpoint = (
+        Path(cfg.paths.checkpoint_dir)
+        / "adaptive_fusion_visual_nemotron_ocr_energy"
+        / "adaptive_fusion_visual_nemotron_ocr_energy_best.pkl"
+    )
+    if branch_checkpoint.exists():
+        return str(branch_checkpoint)
+    nemotron_cfg = getattr(cfg, "visual_nemotron_energy", None)
+    configured = str(getattr(nemotron_cfg, "fusion_checkpoint_path", "") or "")
+    if configured:
+        return configured
+    experiment_checkpoint = str(getattr(getattr(cfg, "experiment", {}), "checkpoint_path", "") or "")
+    if experiment_checkpoint:
+        return experiment_checkpoint
+    return str(
+        Path(cfg.paths.checkpoint_dir)
+        / "adaptive_fusion_visual_colqwen_ocr_chunk"
+        / "adaptive_fusion_visual_colqwen_ocr_chunk_best.pkl"
+    )
+
+
+def _ndcg_at_k(predictions: list[dict], k: int) -> float:
+    """Compute binary NDCG@K for page/image retrieval predictions."""
+    if not predictions:
+        return 0.0
+    total = 0.0
+    for item in predictions:
+        evidence = {str(page) for page in item.get("evidence_pages", [])}
+        if not evidence:
+            continue
+        dcg = 0.0
+        for index, page_id in enumerate(item.get("pred_page_ids", [])[:k], start=1):
+            if str(page_id) in evidence:
+                dcg += 1.0 / np.log2(index + 1)
+        ideal_hits = min(len(evidence), k)
+        idcg = sum(1.0 / np.log2(index + 1) for index in range(1, ideal_hits + 1))
+        total += dcg / max(idcg, 1e-8)
+    return float(total / len(predictions))
+
+
+def _ndcg_corpus_at_k(predictions: list[dict[str, Any]], k: int) -> float:
+    """Compute binary NDCG@K for ViDoRe corpus_id predictions."""
+    if not predictions:
+        return 0.0
+    total = 0.0
+    for item in predictions:
+        gold = set(map(str, item.get("gold_corpus_ids", [])))
+        if not gold:
+            continue
+        dcg = 0.0
+        for index, corpus_id in enumerate(item.get("pred_corpus_ids", [])[:k], start=1):
+            if str(corpus_id) in gold:
+                dcg += 1.0 / np.log2(index + 1)
+        ideal_hits = min(len(gold), k)
+        idcg = sum(1.0 / np.log2(index + 1) for index in range(1, ideal_hits + 1))
+        total += dcg / max(idcg, 1e-8)
+    return float(total / len(predictions))
+
+
+def _merge_vidore_rankings_with_rrf(
+    visual_pred_corpus_ids: list[str],
+    visual_scores: list[float],
+    ocr_pred_corpus_ids: list[str],
+    ocr_scores: list[float],
+    rrf_k: int,
+) -> tuple[list[str], list[float]]:
+    """Merge visual and OCR rankings in corpus_id space with reciprocal-rank fusion."""
+    score_by_corpus_id: dict[str, float] = defaultdict(float)
+    visual_rank_map = {str(corpus_id): rank for rank, corpus_id in enumerate(visual_pred_corpus_ids, start=1)}
+    ocr_rank_map = {str(corpus_id): rank for rank, corpus_id in enumerate(ocr_pred_corpus_ids, start=1)}
+    visual_score_map = {str(corpus_id): float(score) for corpus_id, score in zip(visual_pred_corpus_ids, visual_scores)}
+    ocr_score_map = {str(corpus_id): float(score) for corpus_id, score in zip(ocr_pred_corpus_ids, ocr_scores)}
+
+    for corpus_id, rank in visual_rank_map.items():
+        score_by_corpus_id[corpus_id] += 1.0 / float(rrf_k + rank)
+    for corpus_id, rank in ocr_rank_map.items():
+        score_by_corpus_id[corpus_id] += 1.0 / float(rrf_k + rank)
+
+    ranked_items = sorted(
+        score_by_corpus_id.items(),
+        key=lambda item: (
+            -float(item[1]),
+            visual_rank_map.get(item[0], 10**9),
+            ocr_rank_map.get(item[0], 10**9),
+            -float(visual_score_map.get(item[0], -1e9)),
+            -float(ocr_score_map.get(item[0], -1e9)),
+            str(item[0]),
+        ),
+    )
+    return [str(corpus_id) for corpus_id, _ in ranked_items], [float(score) for _, score in ranked_items]
+
+
+def _merge_page_rankings_with_rrf(
+    visual_pred_page_ids: list[str],
+    visual_scores: list[float],
+    ocr_pred_page_ids: list[str],
+    ocr_scores: list[float],
+    rrf_k: int,
+) -> tuple[list[str], list[float]]:
+    """Merge two page-id rankings with reciprocal-rank fusion."""
+    score_by_page_id: dict[str, float] = defaultdict(float)
+    visual_rank_map = {str(page_id): rank for rank, page_id in enumerate(visual_pred_page_ids, start=1)}
+    ocr_rank_map = {str(page_id): rank for rank, page_id in enumerate(ocr_pred_page_ids, start=1)}
+    visual_score_map = {str(page_id): float(score) for page_id, score in zip(visual_pred_page_ids, visual_scores)}
+    ocr_score_map = {str(page_id): float(score) for page_id, score in zip(ocr_pred_page_ids, ocr_scores)}
+    for page_id, rank in visual_rank_map.items():
+        score_by_page_id[page_id] += 1.0 / float(rrf_k + rank)
+    for page_id, rank in ocr_rank_map.items():
+        score_by_page_id[page_id] += 1.0 / float(rrf_k + rank)
+    ranked_items = sorted(
+        score_by_page_id.items(),
+        key=lambda item: (
+            -item[1],
+            visual_rank_map.get(item[0], 10**9),
+            ocr_rank_map.get(item[0], 10**9),
+            -float(visual_score_map.get(item[0], -1e9)),
+            -float(ocr_score_map.get(item[0], -1e9)),
+            str(item[0]),
+        ),
+    )
+    return [str(page_id) for page_id, _ in ranked_items], [float(score) for _, score in ranked_items]
+
+
+def _canonical_mpdocvqa_page_id(cfg: Any, doc_id: str, page_index: int) -> str:
+    """Normalize one MP-DocVQA page index into a stable page-id string."""
+    template = str(getattr(getattr(cfg, "dataset", {}), "page_id_template", "{doc_id}_p{page_index}"))
+    return template.format(doc_id=str(doc_id), page_index=int(page_index))
+
+
+def _build_mpdocvqa_candidate_pool(
+    cfg: Any,
+    sample: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str], dict[int, str]]:
+    """Build canonicalized page candidates for one MP-DocVQA sample."""
+    question = str(sample.get("question", "") or "").strip()
+    if not question:
+        raise RuntimeError(f"MP-DocVQA sample has empty question: qid={sample.get('qid', '')}")
+    doc_id = str(sample.get("doc_id", "")).strip()
+    image_paths = [str(path) for path in sample.get("image_paths", [])]
+    if not image_paths:
+        raise RuntimeError(f"MP-DocVQA sample has no image_paths: qid={sample.get('qid', '')} doc_id={doc_id}")
+    ocr_paths = list(sample.get("ocr_paths", []))
+    page_texts = [load_page_ocr_text(str(path)) if index < len(ocr_paths) else "" for index, path in enumerate(image_paths)]
+    page_id_to_canonical: dict[int, str] = {
+        int(page_index): _canonical_mpdocvqa_page_id(cfg, doc_id, int(page_index))
+        for page_index in range(len(image_paths))
+    }
+    candidates = [
+        {
+            "page_id": int(page_index),
+            "canonical_page_id": page_id_to_canonical[int(page_index)],
+            "doc_id": doc_id,
+            "image_path": str(image_path),
+            "ocr_text": str(page_texts[page_index]),
+            "image_source_type": "path",
+        }
+        for page_index, image_path in enumerate(image_paths)
+    ]
+    gold_page_ids = [
+        _canonical_mpdocvqa_page_id(cfg, doc_id, int(page_index))
+        for page_index in sample.get("evidence_pages", [])
+    ]
+    return candidates, page_texts, gold_page_ids, page_id_to_canonical
+
+
+def _validate_mpdocvqa_page_id_space(
+    sample: dict[str, Any],
+    pred_page_ids: list[str],
+    gold_page_ids: list[str],
+    candidate_page_ids: list[str],
+) -> None:
+    """Fail fast when MP-DocVQA predictions/gold do not share the same canonical page-id space."""
+    candidate_set = {str(page_id) for page_id in candidate_page_ids}
+    pred_set = {str(page_id) for page_id in pred_page_ids}
+    gold_set = {str(page_id) for page_id in gold_page_ids}
+    if not pred_set.issubset(candidate_set):
+        raise RuntimeError(
+            f"MP-DocVQA predicted page ids are outside the candidate id space: qid={sample.get('qid', '')} "
+            f"doc_id={sample.get('doc_id', '')} unknown={sorted(pred_set - candidate_set)[:10]}"
+        )
+    if gold_set and not gold_set.issubset(candidate_set):
+        raise RuntimeError(
+            f"MP-DocVQA gold page ids are outside the candidate id space: qid={sample.get('qid', '')} "
+            f"doc_id={sample.get('doc_id', '')} unknown={sorted(gold_set - candidate_set)[:10]}"
+        )
+
+
+def _mpdocvqa_recall_at_k(pred_page_ids: list[str], gold_page_ids: set[str], k: int) -> float:
+    """Compute multi-relevant Recall@K in canonical MP-DocVQA page-id space."""
+    if not gold_page_ids:
+        return 0.0
+    hits = len(set(map(str, pred_page_ids[:k])) & gold_page_ids)
+    return float(hits / max(len(gold_page_ids), 1))
+
+
+def _mpdocvqa_hit_at_k(pred_page_ids: list[str], gold_page_ids: set[str], k: int) -> float:
+    """Compute Hit/Top@K in canonical MP-DocVQA page-id space."""
+    return float(bool(set(map(str, pred_page_ids[:k])) & gold_page_ids))
+
+
+def _mpdocvqa_mrr(pred_page_ids: list[str], gold_page_ids: set[str]) -> float:
+    """Compute reciprocal rank of the first relevant page."""
+    for rank, page_id in enumerate(pred_page_ids, start=1):
+        if str(page_id) in gold_page_ids:
+            return 1.0 / float(rank)
+    return 0.0
+
+
+def _evaluate_mpdocvqa_page_retrieval(predictions: list[dict[str, Any]], k_values: list[int]) -> dict[str, float]:
+    """Aggregate page-level retrieval metrics for canonical MP-DocVQA page ids."""
+    if not predictions:
+        return {}
+    metrics: dict[str, float] = {}
+    for k in k_values:
+        metrics[f"Top@{k}"] = sum(
+            _mpdocvqa_hit_at_k(item.get("pred_page_ids", []), set(map(str, item.get("gold_page_ids", []))), int(k))
+            for item in predictions
+        ) / len(predictions)
+        metrics[f"Recall@{k}"] = sum(
+            _mpdocvqa_recall_at_k(item.get("pred_page_ids", []), set(map(str, item.get("gold_page_ids", []))), int(k))
+            for item in predictions
+        ) / len(predictions)
+        metrics[f"Hit@{k}"] = metrics[f"Top@{k}"]
+    metrics["MRR"] = sum(
+        _mpdocvqa_mrr(item.get("pred_page_ids", []), set(map(str, item.get("gold_page_ids", []))))
+        for item in predictions
+    ) / len(predictions)
+    metrics["PageAcc"] = sum(
+        _mpdocvqa_hit_at_k(item.get("pred_page_ids", []), set(map(str, item.get("gold_page_ids", []))), 1)
+        for item in predictions
+    ) / len(predictions)
+    metrics["num_samples"] = len(predictions)
+    return metrics
+
+
+def _ndcg_page_id_at_k(predictions: list[dict[str, Any]], k: int) -> float:
+    """Compute binary nDCG@K for canonical page-id predictions."""
+    if not predictions:
+        return 0.0
+    total = 0.0
+    counted = 0
+    for item in predictions:
+        gold = set(map(str, item.get("gold_page_ids", [])))
+        if not gold:
+            raise RuntimeError("nDCG computation received an MP-DocVQA sample with empty gold_page_ids.")
+        dcg = 0.0
+        for index, page_id in enumerate(item.get("pred_page_ids", [])[:k], start=1):
+            if str(page_id) in gold:
+                dcg += 1.0 / np.log2(index + 1)
+        ideal_hits = min(len(gold), k)
+        idcg = sum(1.0 / np.log2(index + 1) for index in range(1, ideal_hits + 1))
+        total += dcg / max(idcg, 1e-8)
+        counted += 1
+    if counted == 0:
+        raise RuntimeError("nDCG computation received no labeled MP-DocVQA predictions.")
+    return float(total / counted)
+
+
 def run_visual_colqwen_adaptive_coarse_on_dataset(
     cfg: Any,
     dataset_path: str,
@@ -850,9 +2376,10 @@ def run_visual_colqwen_adaptive_coarse_on_dataset(
     )
     router_cfg = getattr(cfg, "retrieval_router", None)
     logger.info(
-        "visual_backend=%s adaptive_coarse=%s bypass_threshold=%s coarse_topk=%s",
+        "visual_backend=%s adaptive_coarse=%s visual_bm25_coarse=%s bypass_threshold=%s coarse_topk=%s",
         "colqwen",
         bool(getattr(router_cfg, "enable_adaptive_coarse", False)),
+        bool(getattr(router_cfg, "enable_bm25_coarse", True)),
         int(getattr(router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(router_cfg, "coarse_topk", 0) or 0),
     )
@@ -1097,9 +2624,10 @@ def run_ocr_page_coarse_chunk_on_dataset(
     )
     ocr_router_cfg = getattr(cfg, "ocr_router", None)
     logger.info(
-        "ocr_backend=%s ocr_page_coarse=%s bypass_threshold=%s coarse_topk=%s",
+        "ocr_backend=%s ocr_page_coarse=%s ocr_bm25_coarse=%s bypass_threshold=%s coarse_topk=%s",
         "bge_chunk_rerank",
         bool(getattr(ocr_router_cfg, "enable_ocr_page_coarse", False)),
+        bool(getattr(ocr_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(ocr_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(ocr_router_cfg, "coarse_topk", 0) or 0),
     )
@@ -1187,9 +2715,11 @@ def run_ocr_page_bm25_bge_rerank_on_dataset(
     semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
     reranker_cfg = getattr(cfg, "ocr_reranker", None)
     logger.info(
-        "ocr_backend=%s ocr_bm25_coarse=%s ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
+        "ocr_backend=%s ocr_page_coarse=%s ocr_bm25_coarse=%s ocr_bypass_threshold=%s ocr_coarse_topk=%s "
+        "ocr_semantic_topk=%s ocr_rerank_topk=%s",
         "ocr_page_bm25_bge_rerank",
         bool(getattr(ocr_router_cfg, "enable_ocr_page_coarse", False)),
+        bool(getattr(ocr_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(ocr_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(ocr_router_cfg, "coarse_topk", 0) or 0),
         int(getattr(semantic_cfg, "semantic_topk", 0) or 0),
@@ -2505,11 +4035,14 @@ def _run_dynamic_fusion_family_on_dataset(
     records = load_jsonl(dataset_path)
     logger.info("Running staged dynamic fusion on %s with %d samples stage=%s topk=%d", dataset_path, len(records), stage_name, topk)
     logger.info(
-        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s ocr_bm25_coarse=%s calibration=%s loss_type=%s",
+        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bm25_coarse=%s "
+        "ocr_page_coarse=%s ocr_bm25_coarse=%s calibration=%s loss_type=%s",
         "colqwen",
         "ocr_page_bm25_bge_rerank",
         bool(getattr(cfg.retrieval_router, "enable_adaptive_coarse", False)),
+        bool(getattr(cfg.retrieval_router, "enable_bm25_coarse", True)),
         bool(getattr(cfg.ocr_router, "enable_ocr_page_coarse", False)),
+        bool(getattr(cfg.ocr_router, "enable_bm25_coarse", True)),
         str(getattr(getattr(cfg, "dynamic_fusion", {}), "calibration_option", "raw")),
         str(getattr(getattr(cfg, "dynamic_fusion", {}), "loss_type", "pointwise_bce")),
     )
@@ -2741,14 +4274,17 @@ def _run_adaptive_fusion_mlp_ocrq_with_backend_on_dataset(
     ocr_semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
     ocr_reranker_cfg = getattr(cfg, "ocr_reranker", None)
     logger.info(
-        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bypass_threshold=%s visual_coarse_topk=%s "
-        "ocr_page_coarse=%s ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
+        "visual_backend=%s ocr_backend=%s visual_adaptive_coarse=%s visual_bm25_coarse=%s "
+        "visual_bypass_threshold=%s visual_coarse_topk=%s ocr_page_coarse=%s ocr_bm25_coarse=%s "
+        "ocr_bypass_threshold=%s ocr_coarse_topk=%s ocr_semantic_topk=%s ocr_rerank_topk=%s",
         visual_backend,
         ocr_backend,
         bool(use_adaptive_coarse_visual and getattr(visual_router_cfg, "enable_adaptive_coarse", False)),
+        bool(getattr(visual_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(visual_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(visual_router_cfg, "coarse_topk", 0) or 0),
         bool(use_ocr_page_coarse and getattr(ocr_router_cfg, "enable_ocr_page_coarse", False)),
+        bool(getattr(ocr_router_cfg, "enable_bm25_coarse", True)),
         int(getattr(ocr_router_cfg, "bypass_threshold", 0) or 0),
         int(getattr(ocr_router_cfg, "coarse_topk", 0) or 0),
         int(getattr(ocr_semantic_cfg, "semantic_topk", 0) or 0),

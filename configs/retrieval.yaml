@@ -10,12 +10,14 @@ retrieval:
 
 retrieval_router:
   enable_adaptive_coarse: true
+  enable_bm25_coarse: false
   bypass_threshold: 40
   coarse_topk: 50
   coarse_method: bm25
 
 ocr_router:
   enable_ocr_page_coarse: true
+  enable_bm25_coarse: false
   bypass_threshold: 40
   coarse_topk: 50
   coarse_method: bm25
@@ -58,6 +60,38 @@ visual_colqwen_retrieval:
   device: cuda:0
   batch_size: 4
   max_pages_per_doc: 256
+
+visual_nemotron_energy:
+  model_name: /home/cuizhibin/projects/Models/nemotron-colembed-vl-8b-v2
+  dataset_path: /home/cuizhibin/projects/Models/vidore_dataset/vidore_v3_energy
+  local_files_only: true
+  device: cuda:0
+  batch_size: 2
+  enable_embedding_cache: true
+  enable_feature_cache: true
+  cache_dir: outputs/cache/visual_nemotron_energy
+  fusion_checkpoint_path: outputs/checkpoints/adaptive_fusion_visual_colqwen_ocr_chunk/adaptive_fusion_visual_colqwen_ocr_chunk_best.pkl
+
+bm25_vidore_energy:
+  dataset_path: /home/cuizhibin/projects/Models/vidore_dataset/vidore_v3_energy
+  sweep_topks: [1, 5, 10, 20, 50, 100, 200, 300, 400, 500, 600, 700 ]
+
+bm25_600_nemotron_bge_vidore_energy:
+  dataset_path: /home/cuizhibin/projects/Models/vidore_dataset/vidore_v3_energy
+  coarse_topk: 600
+  final_merge_strategy: adaptive_fusion_mlp
+  fusion_checkpoint_path: outputs/checkpoints/adaptive_fusion_visual_nemotron_ocr_energy/adaptive_fusion_visual_nemotron_ocr_energy_best.pkl
+
+bm25_600_nemotron_bge_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  final_merge_strategy: rrf
+  rrf_k: 60
+  page_id_format: "{doc_id}_p{page_index}"
+
+visual_nemotron_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  page_id_format: "{doc_id}_p{page_index}"
 
 text_retriever:
   type: bm25

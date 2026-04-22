@@ -9,6 +9,14 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="cuizhibin@100.84.138.106:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/cuizhibin/projects/LightRoute" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/cuizhibin/projects/LightRoute" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
     </serverData>
     <option name="myAutoUpload" value="ALWAYS" />
   </component>

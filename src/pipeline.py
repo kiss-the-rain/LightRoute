@@ -22,6 +22,7 @@ from src.training.train_fusion import (
     train_adaptive_fusion_dynamic_rules,
     train_adaptive_fusion_gating_calibrated,
     train_adaptive_fusion_learned_gating,
+    train_adaptive_fusion_visual_nemotron_ocr_energy,
     train_fusion_ablation,
     train_fusion_mlp_ocrq_bge,
     train_fusion_mlp_ocrq_chunk,
@@ -42,11 +43,15 @@ from src.inference.infer_retrieval import (
     run_adaptive_fusion_learned_gating_on_dataset,
     run_adaptive_fusion_mlp_ocrq_bge_on_dataset,
     run_adaptive_fusion_mlp_ocrq_chunk_on_dataset,
+    run_bm25_600_nemotron_bge_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_bge_vidore_energy_on_dataset,
+    run_adaptive_fusion_visual_nemotron_ocr_energy_on_dataset,
     run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset,
     run_adaptive_fusion_mlp_ocrq_chunkplus_on_dataset,
     run_adaptive_fusion_mlp_ocrq_hybrid_on_dataset,
     run_adaptive_fusion_mlp_ocrq_nvchunk_on_dataset,
     run_adaptive_fusion_v2_on_dataset,
+    run_bm25_vidore_energy_on_dataset,
     run_bm25_retrieval_on_dataset,
     run_ocr_bge_debug_on_dataset,
     run_ocr_bge_chunk_retrieval_on_dataset,
@@ -60,6 +65,9 @@ from src.inference.infer_retrieval import (
     run_rrf_fusion_on_dataset,
     run_visual_colqwen_adaptive_coarse_on_dataset,
     run_visual_colqwen_retrieval_on_dataset,
+    run_visual_nemotron_energy_on_dataset,
+    run_visual_nemotron_mpdocvqa_on_dataset,
+    run_visual_nemotron_energy_sanity_check,
     run_visual_retrieval_on_dataset,
 )
 
@@ -531,6 +539,141 @@ def eval_visual_colqwen_adaptive_coarse_retrieval_pipeline(cfg: Any) -> None:
     logger.info("Saved visual ColQwen adaptive coarse val predictions to %s", prediction_path)
     logger.info("Saved visual ColQwen adaptive coarse val metrics to %s", metrics_path)
     logger.info("Visual ColQwen adaptive coarse val metrics: %s", metrics)
+
+
+def eval_visual_nemotron_energy_pipeline(cfg: Any) -> None:
+    """Run local nemotron-colembed-vl-8b-v2 visual-only retrieval on ViDoRe V3 Energy."""
+    logger = _build_logger(cfg, "eval_visual_nemotron_energy")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_nemotron_energy_on_dataset(
+        cfg=cfg,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_energy_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_nemotron_energy_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual nemotron energy predictions to %s", prediction_path)
+    logger.info("Saved visual nemotron energy metrics to %s", metrics_path)
+    logger.info("Visual nemotron energy metrics: %s", metrics)
+
+
+def eval_bm25_vidore_energy_pipeline(cfg: Any) -> None:
+    """Run BM25-only retrieval on ViDoRe Energy and save outputs."""
+    logger = _build_logger(cfg, "eval_bm25_vidore_energy")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_bm25_vidore_energy_on_dataset(
+        cfg=cfg,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_vidore_energy_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_vidore_energy_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25 ViDoRe Energy predictions to %s", prediction_path)
+    logger.info("Saved BM25 ViDoRe Energy metrics to %s", metrics_path)
+    logger.info("BM25 ViDoRe Energy metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_bge_vidore_energy_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + parallel Nemotron/BGE evaluation on ViDoRe Energy."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_vidore_energy")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_bm25_600_nemotron_bge_vidore_energy_on_dataset(
+        cfg=cfg,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_vidore_energy_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_vidore_energy_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+BGE ViDoRe Energy predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+BGE ViDoRe Energy metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+BGE ViDoRe Energy metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_bge_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + parallel Nemotron/BGE evaluation on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_bge_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    predictions, metrics = run_bm25_600_nemotron_bge_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_mpdocvqa_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_mpdocvqa_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+BGE MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+BGE MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+BGE MP-DocVQA metrics: %s", metrics)
+
+
+def eval_visual_nemotron_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run pure visual-only Nemotron retrieval on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_visual_nemotron_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    dataset_path = str(getattr(getattr(cfg, "visual_nemotron_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    predictions, metrics = run_visual_nemotron_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_mpdocvqa_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_nemotron_mpdocvqa_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual nemotron MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved visual nemotron MP-DocVQA metrics to %s", metrics_path)
+    logger.info("Visual nemotron MP-DocVQA metrics: %s", metrics)
+
+
+def debug_visual_nemotron_energy_sanity_pipeline(cfg: Any) -> None:
+    """Run a tiny deterministic corpus-id sanity check for local Nemotron visual retrieval."""
+    logger = _build_logger(cfg, "debug_visual_nemotron_energy_sanity")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_visual_nemotron_energy_sanity_check(cfg=cfg, num_samples=3, num_negatives=9)
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_energy_sanity_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "visual_nemotron_energy_sanity_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved visual nemotron sanity predictions to %s", prediction_path)
+    logger.info("Saved visual nemotron sanity metrics to %s", metrics_path)
+    logger.info("Visual nemotron sanity metrics: %s", metrics)
+
+
+def eval_adaptive_fusion_visual_nemotron_ocr_energy_val_pipeline(cfg: Any) -> None:
+    """Evaluate local Nemotron visual backbone + existing OCR route + adaptive fusion on ViDoRe Energy."""
+    logger = _build_logger(cfg, "eval_adaptive_fusion_visual_nemotron_ocr_energy_val")
+    _ensure_runtime_dirs(cfg)
+    predictions, metrics = run_adaptive_fusion_visual_nemotron_ocr_energy_on_dataset(
+        cfg=cfg,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+    )
+    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_predictions.jsonl"
+    metrics_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_metrics.json"
+    save_jsonl(predictions, prediction_path)
+    save_json(metrics, metrics_path)
+    logger.info("Saved adaptive_fusion_visual_nemotron_ocr_energy val predictions to %s", prediction_path)
+    logger.info("Saved adaptive_fusion_visual_nemotron_ocr_energy val metrics to %s", metrics_path)
+    logger.info("Adaptive fusion visual_nemotron_ocr_energy metrics: %s", metrics)
+
+
+def train_adaptive_fusion_visual_nemotron_ocr_energy_pipeline(cfg: Any) -> None:
+    """Train only the fusion MLP for local Nemotron visual backbone + existing OCR route."""
+    logger = _build_logger(cfg, "train_adaptive_fusion_visual_nemotron_ocr_energy")
+    _ensure_runtime_dirs(cfg)
+    metrics = train_adaptive_fusion_visual_nemotron_ocr_energy(cfg)
+    logger.info("adaptive_fusion_visual_nemotron_ocr_energy training completed. checkpoint=%s", metrics.get("checkpoint_path", ""))
 
 
 def eval_ocr_page_coarse_chunk_pipeline(cfg: Any) -> None:

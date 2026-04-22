@@ -10,8 +10,21 @@ from src.retrieval.adaptive_coarse_router import (
     route_document_pages_with_adaptive_coarse,
 )
 from src.retrieval.bm25_retriever import load_page_ocr_text
-from src.retrieval.ocr_bge_retriever import OCRBGERetriever
+from src.retrieval.ocr_bge_retriever import OCRBGERetriever, format_bge_query
 from src.retrieval.ocr_bge_reranker import OCRBGEReranker
+
+
+def _resolve_ocr_query_text(
+    sample: dict[str, Any],
+    *,
+    query_text: str | None = None,
+    query_variant: str = "raw_question",
+) -> str:
+    """Resolve and format the query text used by OCR BGE retrieval/rerank."""
+    raw_query = str(query_text or sample.get("question") or sample.get("query") or "").strip()
+    if not raw_query:
+        return ""
+    return format_bge_query(raw_query, variant=query_variant)
 
 
 def run_ocr_page_bm25_coarse(
@@ -42,10 +55,13 @@ def run_ocr_page_bge_m3(
     indexed_docs: set[str],
     candidate_page_ids: list[int],
     page_text_cache: dict[str, list[str]],
+    query_text: str | None = None,
+    query_variant: str = "raw_question",
+    doc_id_override: str | None = None,
     semantic_topk: int | None = None,
 ) -> tuple[dict[str, list], dict[str, Any]]:
     """Run page-level dense retrieval with BGE-M3 on a routed OCR page subset."""
-    doc_id = str(sample["doc_id"])
+    doc_id = str(doc_id_override or sample["doc_id"])
     doc_key = f"ocr_page:{doc_id}"
     stats = {
         "ocr_bge_embedding_cache_hits": 0,
@@ -54,7 +70,11 @@ def run_ocr_page_bge_m3(
     }
     page_texts = page_text_cache.get(doc_id)
     if page_texts is None:
-        page_texts = [load_page_ocr_text(path) for path in sample.get("ocr_paths", [])]
+        explicit_page_texts = list(sample.get("page_texts", []))
+        if explicit_page_texts:
+            page_texts = [str(text or "") for text in explicit_page_texts]
+        else:
+            page_texts = [load_page_ocr_text(path) for path in sample.get("ocr_paths", [])]
         image_paths = list(sample.get("image_paths", []))
         if image_paths and len(page_texts) < len(image_paths):
             page_texts.extend(["" for _ in range(len(image_paths) - len(page_texts))])
@@ -78,9 +98,10 @@ def run_ocr_page_bge_m3(
         effective_topk = int(getattr(semantic_cfg, "semantic_topk", 0) or 0)
     if effective_topk <= 0:
         effective_topk = None
+    formatted_query = _resolve_ocr_query_text(sample, query_text=query_text, query_variant=query_variant)
 
     dense_result = retriever.retrieve_subset(
-        query=str(sample.get("question", "")),
+        query=formatted_query,
         doc_id=doc_key,
         candidate_page_ids=[int(page_id) for page_id in candidate_page_ids],
         topk=effective_topk,
@@ -96,6 +117,8 @@ def run_ocr_page_reranker(
     retriever: OCRBGERetriever,
     retriever_doc_id: str,
     semantic_result: dict[str, list],
+    query_text: str | None = None,
+    query_variant: str = "raw_question",
     rerank_topk: int | None = None,
 ) -> tuple[dict[str, list], dict[str, Any]]:
     """Rerank page-level OCR candidates with bge-reranker-v2-m3."""
@@ -134,10 +157,99 @@ def run_ocr_page_reranker(
         }
         for page_id, score in zip(semantic_result.get("page_ids", []), semantic_result.get("scores", []))
     ]
-    reranked = reranker.rerank(str(sample.get("question", "")), candidates, topk=effective_topk)
+    formatted_query = _resolve_ocr_query_text(sample, query_text=query_text, query_variant=query_variant)
+    reranked = reranker.rerank(formatted_query, candidates, topk=effective_topk)
     stats["ocr_rerank_calls"] = 1
     stats["ocr_num_pages_after_rerank"] = len(reranked.get("page_ids", []))
     return reranked, stats
+
+
+def run_ocr_page_pipeline_for_subset(
+    cfg: Any,
+    sample: dict[str, Any],
+    candidate_page_ids: list[int],
+    topk: int,
+    retriever: OCRBGERetriever,
+    indexed_docs: set[str],
+    reranker: OCRBGEReranker | None = None,
+    page_text_cache: dict[str, list[str]] | None = None,
+    doc_id_override: str | None = None,
+    query_text: str | None = None,
+    query_variant: str = "raw_question",
+    semantic_topk: int | None = None,
+    rerank_topk: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the OCR page BGE+rereank stack on a preselected page subset."""
+    page_text_cache = page_text_cache or {}
+    effective_doc_id = str(doc_id_override or sample["doc_id"])
+    doc_key = f"ocr_page:{effective_doc_id}"
+    normalized_candidate_page_ids = [int(page_id) for page_id in candidate_page_ids]
+    semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
+    if bool(getattr(semantic_cfg, "enable_bge_m3", True)):
+        semantic_result, semantic_stats = run_ocr_page_bge_m3(
+            cfg=cfg,
+            sample=sample,
+            retriever=retriever,
+            indexed_docs=indexed_docs,
+            candidate_page_ids=normalized_candidate_page_ids,
+            page_text_cache=page_text_cache,
+            query_text=query_text,
+            query_variant=query_variant,
+            doc_id_override=effective_doc_id,
+            semantic_topk=semantic_topk,
+        )
+    else:
+        page_texts = page_text_cache.get(effective_doc_id)
+        if page_texts is None:
+            explicit_page_texts = list(sample.get("page_texts", []))
+            if explicit_page_texts:
+                page_texts = [str(text or "") for text in explicit_page_texts]
+            else:
+                page_texts = [load_page_ocr_text(path) for path in sample.get("ocr_paths", [])]
+            page_text_cache[effective_doc_id] = page_texts
+        if doc_key not in indexed_docs:
+            page_ids = list(sample.get("page_ids", normalized_candidate_page_ids))
+            retriever.build_document_index(doc_id=doc_key, page_texts=page_texts, page_ids=page_ids[: len(page_texts)])
+            indexed_docs.add(doc_key)
+        effective_semantic_topk = len(normalized_candidate_page_ids) if semantic_topk is None else min(int(semantic_topk), len(normalized_candidate_page_ids))
+        semantic_result = {
+            "page_ids": list(normalized_candidate_page_ids[:effective_semantic_topk]),
+            "scores": [0.0 for _ in range(effective_semantic_topk)],
+            "ranks": list(range(1, effective_semantic_topk + 1)),
+        }
+        semantic_stats = {
+            "ocr_bge_embedding_cache_hits": 0,
+            "ocr_bge_embedding_cache_misses": 0,
+            "ocr_num_pages_after_bge": len(semantic_result["page_ids"]),
+        }
+
+    effective_rerank_topk = rerank_topk
+    if effective_rerank_topk is None:
+        effective_rerank_topk = int(getattr(getattr(cfg, "ocr_reranker", None), "rerank_topk", 0) or topk)
+    reranked_result, rerank_stats = run_ocr_page_reranker(
+        cfg=cfg,
+        sample=sample,
+        reranker=reranker,
+        retriever=retriever,
+        retriever_doc_id=doc_key,
+        semantic_result=semantic_result,
+        query_text=query_text,
+        query_variant=query_variant,
+        rerank_topk=effective_rerank_topk,
+    )
+    reranked_result["ocr_bge_stage"] = {
+        "semantic_topk": int(semantic_topk or getattr(getattr(cfg, "ocr_semantic_retrieval", None), "semantic_topk", 0) or 0),
+        "num_pages_after_bge": int(semantic_stats.get("ocr_num_pages_after_bge", 0)),
+    }
+    reranked_result["ocr_reranker_stage"] = {
+        "rerank_topk": int(effective_rerank_topk or 0),
+        "num_pages_after_rerank": int(rerank_stats.get("ocr_num_pages_after_rerank", 0)),
+    }
+    reranked_result["routed_page_ids"] = list(normalized_candidate_page_ids)
+    stats = {}
+    stats.update(semantic_stats)
+    stats.update(rerank_stats)
+    return reranked_result, stats
 
 
 def run_ocr_page_pipeline_for_sample(
@@ -160,55 +272,19 @@ def run_ocr_page_pipeline_for_sample(
         doc_retriever_cache=bm25_doc_retriever_cache,
     )
     routed_page_ids = [int(page_id) for page_id in route_result.get("page_ids", [])]
-    doc_key = f"ocr_page:{sample['doc_id']}"
-    semantic_cfg = getattr(cfg, "ocr_semantic_retrieval", None)
-    if bool(getattr(semantic_cfg, "enable_bge_m3", True)):
-        semantic_result, semantic_stats = run_ocr_page_bge_m3(
-            cfg=cfg,
-            sample=sample,
-            retriever=retriever,
-            indexed_docs=indexed_docs,
-            candidate_page_ids=routed_page_ids,
-            page_text_cache=bm25_doc_text_cache,
-        )
-    else:
-        page_texts = bm25_doc_text_cache.get(str(sample["doc_id"])) or [load_page_ocr_text(path) for path in sample.get("ocr_paths", [])]
-        page_ids = extract_sample_page_ids(sample, len(page_texts))
-        if doc_key not in indexed_docs:
-            retriever.build_document_index(doc_id=doc_key, page_texts=page_texts, page_ids=page_ids)
-            indexed_docs.add(doc_key)
-        semantic_result = {
-            "page_ids": list(routed_page_ids),
-            "scores": [float(score) for score in route_result.get("scores", [])[: len(routed_page_ids)]],
-            "ranks": list(range(1, len(routed_page_ids) + 1)),
-        }
-        semantic_stats = {
-            "ocr_bge_embedding_cache_hits": 0,
-            "ocr_bge_embedding_cache_misses": 0,
-            "ocr_num_pages_after_bge": len(routed_page_ids),
-        }
-    reranker_cfg = getattr(cfg, "ocr_reranker", None)
-    reranked_result, rerank_stats = run_ocr_page_reranker(
+    reranked_result, subset_stats = run_ocr_page_pipeline_for_subset(
         cfg=cfg,
         sample=sample,
-        reranker=reranker,
+        candidate_page_ids=routed_page_ids,
+        topk=topk,
         retriever=retriever,
-        retriever_doc_id=doc_key,
-        semantic_result=semantic_result,
-        rerank_topk=int(getattr(reranker_cfg, "rerank_topk", 0) or topk),
+        indexed_docs=indexed_docs,
+        reranker=reranker,
+        page_text_cache=bm25_doc_text_cache,
     )
     reranked_result["ocr_page_coarse"] = route_result.get("metadata", {})
-    reranked_result["ocr_bge_stage"] = {
-        "semantic_topk": int(getattr(getattr(cfg, "ocr_semantic_retrieval", None), "semantic_topk", 0) or 0),
-        "num_pages_after_bge": int(semantic_stats.get("ocr_num_pages_after_bge", 0)),
-    }
-    reranked_result["ocr_reranker_stage"] = {
-        "rerank_topk": int(getattr(getattr(cfg, "ocr_reranker", None), "rerank_topk", 0) or 0),
-        "num_pages_after_rerank": int(rerank_stats.get("ocr_num_pages_after_rerank", 0)),
-    }
     reranked_result["routed_page_ids"] = routed_page_ids
     stats = {}
     stats.update(route_stats)
-    stats.update(semantic_stats)
-    stats.update(rerank_stats)
+    stats.update(subset_stats)
     return reranked_result, stats

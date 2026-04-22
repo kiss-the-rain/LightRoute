@@ -13,6 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.pipeline import (  # noqa: E402
     build_indexes_pipeline,
+    eval_bm25_600_nemotron_bge_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_bge_vidore_energy_pipeline,
+    eval_bm25_vidore_energy_pipeline,
     eval_bm25_retrieval_pipeline,
     eval_docvqa_pipeline,
     eval_adaptive_fusion_pipeline,
@@ -29,6 +32,7 @@ from src.pipeline import (  # noqa: E402
     eval_adaptive_fusion_dynamic_rules_val_pipeline,
     eval_adaptive_fusion_gating_calibrated_val_pipeline,
     eval_adaptive_fusion_learned_gating_val_pipeline,
+    eval_adaptive_fusion_visual_nemotron_ocr_energy_val_pipeline,
     eval_adaptive_fusion_visual_colqwen_ocr_chunk_val_pipeline,
     eval_adaptive_fusion_mlp_ocrq_chunkplus_pipeline,
     eval_adaptive_fusion_mlp_ocrq_hybrid_pipeline,
@@ -47,6 +51,9 @@ from src.pipeline import (  # noqa: E402
     eval_ocr_page_coarse_chunk_pipeline,
     eval_visual_colqwen_adaptive_coarse_retrieval_pipeline,
     eval_visual_colqwen_retrieval_pipeline,
+    eval_visual_nemotron_mpdocvqa_pipeline,
+    debug_visual_nemotron_energy_sanity_pipeline,
+    eval_visual_nemotron_energy_pipeline,
     eval_fixed_fusion_pipeline,
     eval_retrieval_pipeline,
     eval_rrf_pipeline,
@@ -95,6 +102,7 @@ from src.pipeline import (  # noqa: E402
     train_adaptive_fusion_dynamic_rules_pipeline,
     train_adaptive_fusion_gating_calibrated_pipeline,
     train_adaptive_fusion_learned_gating_pipeline,
+    train_adaptive_fusion_visual_nemotron_ocr_energy_pipeline,
     train_adaptive_fusion_visual_colqwen_ocr_chunk_pipeline,
     train_adaptive_fusion_mlp_ocrq_chunkplus_pipeline,
     train_adaptive_fusion_mlp_ocrq_hybrid_pipeline,
@@ -145,9 +153,15 @@ def parse_args() -> argparse.Namespace:
             "eval_ocr_nv_chunk_val",
             "eval_ocr_page_coarse_chunk_val",
             "eval_ocr_page_bm25_bge_rerank_val",
+            "eval_bm25_vidore_energy",
+            "eval_bm25_600_nemotron_bge_vidore_energy",
+            "eval_bm25_600_nemotron_bge_mpdocvqa",
             "eval_visual_val",
             "eval_visual_colqwen_val",
             "eval_visual_colqwen_adaptive_coarse_val",
+            "eval_visual_nemotron_mpdocvqa",
+            "eval_visual_nemotron_energy",
+            "debug_visual_nemotron_energy_sanity",
             "eval_fixed_fusion_val",
             "eval_rrf_val",
             "train_adaptive_fusion",
@@ -164,6 +178,7 @@ def parse_args() -> argparse.Namespace:
             "train_adaptive_fusion_dynamic_rules",
             "train_adaptive_fusion_learned_gating",
             "train_adaptive_fusion_gating_calibrated",
+            "train_adaptive_fusion_visual_nemotron_ocr_energy",
             "train_adaptive_fusion_visual_colqwen_ocr_chunk",
             "train_adaptive_fusion_mlp_ocrq_chunkplus",
             "train_adaptive_fusion_mlp_ocrq_hybrid",
@@ -183,6 +198,7 @@ def parse_args() -> argparse.Namespace:
             "eval_adaptive_fusion_dynamic_rules_val",
             "eval_adaptive_fusion_learned_gating_val",
             "eval_adaptive_fusion_gating_calibrated_val",
+            "eval_adaptive_fusion_visual_nemotron_ocr_energy_val",
             "eval_adaptive_fusion_visual_colqwen_ocr_chunk_val",
             "eval_adaptive_fusion_mlp_ocrq_chunkplus_val",
             "eval_adaptive_fusion_mlp_ocrq_hybrid_val",
@@ -245,6 +261,8 @@ def main() -> None:
             cfg.ocr_jina_retrieval.device = args.device
         if hasattr(cfg, "visual_colqwen_retrieval"):
             cfg.visual_colqwen_retrieval.device = args.device
+        if hasattr(cfg, "visual_nemotron_energy"):
+            cfg.visual_nemotron_energy.device = args.device
     if args.max_train_samples is not None:
         cfg.training.max_train_samples = int(args.max_train_samples)
     if args.max_val_samples is not None:
@@ -254,6 +272,9 @@ def main() -> None:
         "build_indexes": build_indexes_pipeline,
         "eval_retrieval": eval_retrieval_pipeline,
         "eval_bm25_val": eval_bm25_retrieval_pipeline,
+        "eval_bm25_vidore_energy": eval_bm25_vidore_energy_pipeline,
+        "eval_bm25_600_nemotron_bge_vidore_energy": eval_bm25_600_nemotron_bge_vidore_energy_pipeline,
+        "eval_bm25_600_nemotron_bge_mpdocvqa": eval_bm25_600_nemotron_bge_mpdocvqa_pipeline,
         "eval_ocr_bge_val": eval_ocr_bge_retrieval_pipeline,
         "eval_ocr_bge_debug_val": eval_ocr_bge_debug_pipeline,
         "eval_ocr_bge_rerank_val": eval_ocr_bge_rerank_pipeline,
@@ -268,6 +289,9 @@ def main() -> None:
         "eval_visual_val": eval_visual_retrieval_pipeline,
         "eval_visual_colqwen_val": eval_visual_colqwen_retrieval_pipeline,
         "eval_visual_colqwen_adaptive_coarse_val": eval_visual_colqwen_adaptive_coarse_retrieval_pipeline,
+        "eval_visual_nemotron_mpdocvqa": eval_visual_nemotron_mpdocvqa_pipeline,
+        "eval_visual_nemotron_energy": eval_visual_nemotron_energy_pipeline,
+        "debug_visual_nemotron_energy_sanity": debug_visual_nemotron_energy_sanity_pipeline,
         "eval_fixed_fusion_val": eval_fixed_fusion_pipeline,
         "eval_rrf_val": eval_rrf_pipeline,
         "train_adaptive_fusion": train_adaptive_fusion_pipeline,
@@ -284,6 +308,7 @@ def main() -> None:
         "train_adaptive_fusion_dynamic_rules": train_adaptive_fusion_dynamic_rules_pipeline,
         "train_adaptive_fusion_learned_gating": train_adaptive_fusion_learned_gating_pipeline,
         "train_adaptive_fusion_gating_calibrated": train_adaptive_fusion_gating_calibrated_pipeline,
+        "train_adaptive_fusion_visual_nemotron_ocr_energy": train_adaptive_fusion_visual_nemotron_ocr_energy_pipeline,
         "train_adaptive_fusion_visual_colqwen_ocr_chunk": train_adaptive_fusion_visual_colqwen_ocr_chunk_pipeline,
         "train_adaptive_fusion_mlp_ocrq_chunkplus": train_adaptive_fusion_mlp_ocrq_chunkplus_pipeline,
         "train_adaptive_fusion_mlp_ocrq_hybrid": train_adaptive_fusion_mlp_ocrq_hybrid_pipeline,
@@ -303,6 +328,7 @@ def main() -> None:
         "eval_adaptive_fusion_dynamic_rules_val": eval_adaptive_fusion_dynamic_rules_val_pipeline,
         "eval_adaptive_fusion_learned_gating_val": eval_adaptive_fusion_learned_gating_val_pipeline,
         "eval_adaptive_fusion_gating_calibrated_val": eval_adaptive_fusion_gating_calibrated_val_pipeline,
+        "eval_adaptive_fusion_visual_nemotron_ocr_energy_val": eval_adaptive_fusion_visual_nemotron_ocr_energy_val_pipeline,
         "eval_adaptive_fusion_visual_colqwen_ocr_chunk_val": eval_adaptive_fusion_visual_colqwen_ocr_chunk_val_pipeline,
         "eval_adaptive_fusion_mlp_ocrq_chunkplus_val": eval_adaptive_fusion_mlp_ocrq_chunkplus_pipeline,
         "eval_adaptive_fusion_mlp_ocrq_hybrid_val": eval_adaptive_fusion_mlp_ocrq_hybrid_pipeline,

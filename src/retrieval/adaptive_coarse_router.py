@@ -6,6 +6,11 @@ import re
 from typing import Any
 
 from src.retrieval.bm25_retriever import BM25Retriever, load_page_ocr_text
+from src.utils.logger import get_logger
+
+
+_LOGGER = get_logger("adaptive_coarse_router")
+_BM25_DISABLED_LOG_KEYS: set[str] = set()
 
 
 def route_document_pages_with_adaptive_coarse(
@@ -20,16 +25,18 @@ def route_document_pages_with_adaptive_coarse(
     """Route one document's page pool through bypass-or-BM25 adaptive coarse retrieval."""
     router_cfg = router_cfg or getattr(cfg, "retrieval_router", None)
     enabled = bool(getattr(router_cfg, enabled_attr, False))
+    bm25_enabled = bool(getattr(router_cfg, "enable_bm25_coarse", True))
     coarse_method = str(getattr(router_cfg, "coarse_method", "bm25"))
     bypass_threshold = int(getattr(router_cfg, "bypass_threshold", 0) or 0)
     coarse_topk = int(getattr(router_cfg, "coarse_topk", 0) or 0)
 
-    if coarse_method != "bm25":
+    if bm25_enabled and coarse_method != "bm25":
         raise ValueError(f"Unsupported adaptive coarse method: {coarse_method}")
 
     doc_id = str(sample["doc_id"])
     stats = {
         _metric_key(stats_prefix, "adaptive_coarse_enabled"): float(enabled),
+        _metric_key(stats_prefix, "bm25_coarse_enabled"): float(bm25_enabled),
         _metric_key(stats_prefix, "num_pages_before_coarse"): 0,
         _metric_key(stats_prefix, "num_pages_after_coarse"): 0,
         _metric_key(stats_prefix, "num_bypass_samples"): 0,
@@ -40,11 +47,41 @@ def route_document_pages_with_adaptive_coarse(
         _metric_key(stats_prefix, "coarse_index_cache_misses"): 0,
     }
 
+    if not bm25_enabled:
+        candidate_paths = list(sample.get("image_paths") or sample.get("ocr_paths") or [])
+        cached_texts = doc_text_cache.get(doc_id)
+        max_len = len(candidate_paths) if candidate_paths else len(cached_texts or [])
+        page_ids = _extract_sample_page_ids(sample, max_len)
+        num_pages = len(page_ids)
+        stats[_metric_key(stats_prefix, "num_pages_before_coarse")] = num_pages
+        stats[_metric_key(stats_prefix, "num_pages_after_coarse")] = num_pages
+        stats[_metric_key(stats_prefix, "num_bypass_samples")] = 1 if num_pages else 0
+        metadata = {
+            "num_pages_before": num_pages,
+            "num_pages_after": num_pages,
+            "bypassed": True,
+            "coarse_method": coarse_method,
+            "bm25_coarse_enabled": False,
+            "bypass_threshold": bypass_threshold,
+            "coarse_topk": coarse_topk,
+            "disable_reason": "bm25_disabled",
+        }
+        _log_bm25_disabled_once(stats_prefix, enabled_attr)
+        return {
+            "page_ids": list(page_ids),
+            "scores": [0.0 for _ in page_ids],
+            "ranks": list(range(1, len(page_ids) + 1)),
+            "metadata": metadata,
+        }, stats
+
     page_texts = doc_text_cache.get(doc_id)
     if page_texts is None:
         ocr_paths = list(sample.get("ocr_paths", []))
         image_paths = list(sample.get("image_paths", []))
-        if ocr_paths:
+        explicit_page_texts = list(sample.get("page_texts", []))
+        if explicit_page_texts:
+            page_texts = [str(text or "") for text in explicit_page_texts]
+        elif ocr_paths:
             page_texts = [load_page_ocr_text(path) for path in ocr_paths]
         else:
             page_texts = ["" for _ in image_paths]
@@ -68,6 +105,7 @@ def route_document_pages_with_adaptive_coarse(
         "num_pages_after": num_pages,
         "bypassed": True,
         "coarse_method": coarse_method,
+        "bm25_coarse_enabled": True,
         "bypass_threshold": bypass_threshold,
         "coarse_topk": coarse_topk,
     }
@@ -145,6 +183,10 @@ def summarize_adaptive_coarse_stats(stats: dict[str, Any], num_samples: int, sta
 
 def extract_sample_page_ids(sample: dict[str, Any], max_len: int) -> list[int]:
     """Derive canonical page ids from page assets while preserving original document numbering."""
+    explicit_page_ids = sample.get("page_ids") or sample.get("candidate_page_ids")
+    if explicit_page_ids:
+        limit = max_len if max_len > 0 else len(explicit_page_ids)
+        return [int(page_id) for page_id in list(explicit_page_ids)[:limit]]
     candidate_paths = sample.get("image_paths") or sample.get("ocr_paths") or []
     page_ids: list[int] = []
     for path in list(candidate_paths)[:max_len]:
@@ -172,6 +214,19 @@ def _extract_sample_page_ids(sample: dict[str, Any], max_len: int) -> list[int]:
 def _metric_key(prefix: str, base_name: str) -> str:
     """Prefix a metric key when a branch-specific namespace is requested."""
     return f"{prefix}_{base_name}" if prefix else base_name
+
+
+def _log_bm25_disabled_once(stats_prefix: str, enabled_attr: str) -> None:
+    """Avoid emitting one BM25-disabled line per sample on large evaluations."""
+    key = f"{stats_prefix}:{enabled_attr}"
+    if key in _BM25_DISABLED_LOG_KEYS:
+        return
+    _BM25_DISABLED_LOG_KEYS.add(key)
+    _LOGGER.info(
+        "BM25 coarse retrieval disabled; using full candidate page set. stats_prefix=%s enabled_attr=%s",
+        stats_prefix or "default",
+        enabled_attr,
+    )
 
 
 def _extract_page_idx_from_path(path_or_name: str) -> int:
