@@ -44,6 +44,14 @@ from src.inference.infer_retrieval import (
     run_adaptive_fusion_mlp_ocrq_bge_on_dataset,
     run_adaptive_fusion_mlp_ocrq_chunk_on_dataset,
     run_bm25_600_nemotron_bge_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_bge_selective_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_bge_topk_rerank_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_jina_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_jina_chunk_mpdocvqa_on_dataset,
+    run_bm25_600_nemotron_bge_dynamic_mpdocvqa_on_dataset,
+    run_bm25_600_queryaware_dynamic_mpdocvqa_on_dataset,
+    run_bm25_600_queryaware_visual_dominant_mpdocvqa_on_dataset,
+    run_bm25_600_selective_confidence_mpdocvqa_on_dataset,
     run_bm25_600_nemotron_bge_vidore_energy_on_dataset,
     run_adaptive_fusion_visual_nemotron_ocr_energy_on_dataset,
     run_adaptive_fusion_visual_colqwen_ocr_chunk_on_dataset,
@@ -545,14 +553,14 @@ def eval_visual_nemotron_energy_pipeline(cfg: Any) -> None:
     """Run local nemotron-colembed-vl-8b-v2 visual-only retrieval on ViDoRe V3 Energy."""
     logger = _build_logger(cfg, "eval_visual_nemotron_energy")
     _ensure_runtime_dirs(cfg)
-    predictions, metrics = run_visual_nemotron_energy_on_dataset(
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_energy_predictions.jsonl"
+    _predictions, metrics = run_visual_nemotron_energy_on_dataset(
         cfg=cfg,
         topk=int(cfg.retrieval.topk),
         k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
     )
-    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_energy_predictions.jsonl"
     metrics_path = Path(cfg.paths.metric_dir) / "visual_nemotron_energy_metrics.json"
-    save_jsonl(predictions, prediction_path)
     save_json(metrics, metrics_path)
     logger.info("Saved visual nemotron energy predictions to %s", prediction_path)
     logger.info("Saved visual nemotron energy metrics to %s", metrics_path)
@@ -600,19 +608,189 @@ def eval_bm25_600_nemotron_bge_mpdocvqa_pipeline(cfg: Any) -> None:
     logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_mpdocvqa")
     _ensure_runtime_dirs(cfg)
     dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_bge_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
-    predictions, metrics = run_bm25_600_nemotron_bge_mpdocvqa_on_dataset(
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_bge_mpdocvqa_on_dataset(
         cfg=cfg,
         dataset_path=dataset_path,
         topk=int(cfg.retrieval.topk),
         k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
     )
-    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_mpdocvqa_predictions.jsonl"
     metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_mpdocvqa_metrics.json"
-    save_jsonl(predictions, prediction_path)
     save_json(metrics, metrics_path)
     logger.info("Saved BM25-600 Nemotron+BGE MP-DocVQA predictions to %s", prediction_path)
     logger.info("Saved BM25-600 Nemotron+BGE MP-DocVQA metrics to %s", metrics_path)
     logger.info("BM25-600 Nemotron+BGE MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_bge_selective_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + Nemotron/BGE with visual-confidence selective fusion on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_selective_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[Selective Fusion] Using hard-gating branch before existing RRF fusion")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_bge_selective_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_selective_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_bge_selective_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_selective_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+BGE selective MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+BGE selective MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+BGE selective MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + Nemotron visual Top-K + BGE OCR rerank on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[TopK-Rerank] Using visual Top-K followed by existing BGE OCR reranker")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_bge_topk_rerank_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_topk_rerank_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_bge_topk_rerank_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_topk_rerank_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+BGE TopK-Rerank MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+BGE TopK-Rerank MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+BGE TopK-Rerank MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_jina_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + parallel Nemotron/Jina evaluation on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_jina_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_jina_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_jina_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_jina_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_jina_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+Jina MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+Jina MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+Jina MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_jina_chunk_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + Nemotron + Jina page retrieval + chunk rerank on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_jina_chunk_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[Pipeline] Using OCR CHUNK rerank branch")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_jina_chunk_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_jina_chunk_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_jina_chunk_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_jina_chunk_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+Jina-Chunk MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+Jina-Chunk MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+Jina-Chunk MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_nemotron_bge_dynamic_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + Nemotron + OCR with reused colqwen dynamic weighting on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_nemotron_bge_dynamic_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_nemotron_bge_dynamic_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_nemotron_bge_dynamic_mpdocvqa.jsonl"
+    _predictions, metrics = run_bm25_600_nemotron_bge_dynamic_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_nemotron_bge_dynamic_mpdocvqa.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 Nemotron+BGE dynamic MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 Nemotron+BGE dynamic MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 Nemotron+BGE dynamic MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_queryaware_dynamic_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + query-aware routing with existing dynamic fusion fallback on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_queryaware_dynamic_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[Router] Using query-aware routing before existing dynamic fusion fallback")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_queryaware_dynamic_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_queryaware_dynamic_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_queryaware_dynamic_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_queryaware_dynamic_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 query-aware dynamic MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 query-aware dynamic MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 query-aware dynamic MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_queryaware_visual_dominant_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + query-aware visual-dominant OCR correction on MP-DocVQA."""
+    logger = _build_logger(cfg, "eval_bm25_600_queryaware_visual_dominant_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[Router] Using query-aware visual-dominant OCR correction")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_queryaware_visual_dominant_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_queryaware_visual_dominant_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_queryaware_visual_dominant_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_queryaware_visual_dominant_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 query-aware visual-dominant MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 query-aware visual-dominant MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 query-aware visual-dominant MP-DocVQA metrics: %s", metrics)
+
+
+def eval_bm25_600_selective_confidence_mpdocvqa_pipeline(cfg: Any) -> None:
+    """Run BM25@600 + selective confidence routing with visual-dominant OCR correction."""
+    logger = _build_logger(cfg, "eval_bm25_600_selective_confidence_mpdocvqa")
+    _ensure_runtime_dirs(cfg)
+    logger.info("[SelectiveConfidence] Using confidence-routed visual-dominant OCR correction")
+    dataset_path = str(getattr(getattr(cfg, "bm25_600_selective_confidence_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
+    prediction_path = Path(cfg.paths.prediction_dir) / "bm25_600_selective_confidence_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_bm25_600_selective_confidence_mpdocvqa_on_dataset(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        topk=int(cfg.retrieval.topk),
+        k_values=list(cfg.retrieval.k_values),
+        checkpoint_path=str(cfg.experiment.checkpoint_path or ""),
+        prediction_path=str(prediction_path),
+    )
+    metrics_path = Path(cfg.paths.metric_dir) / "bm25_600_selective_confidence_mpdocvqa_metrics.json"
+    save_json(metrics, metrics_path)
+    logger.info("Saved BM25-600 selective confidence MP-DocVQA predictions to %s", prediction_path)
+    logger.info("Saved BM25-600 selective confidence MP-DocVQA metrics to %s", metrics_path)
+    logger.info("BM25-600 selective confidence MP-DocVQA metrics: %s", metrics)
 
 
 def eval_visual_nemotron_mpdocvqa_pipeline(cfg: Any) -> None:
@@ -620,15 +798,15 @@ def eval_visual_nemotron_mpdocvqa_pipeline(cfg: Any) -> None:
     logger = _build_logger(cfg, "eval_visual_nemotron_mpdocvqa")
     _ensure_runtime_dirs(cfg)
     dataset_path = str(getattr(getattr(cfg, "visual_nemotron_mpdocvqa", {}), "dataset_path", cfg.dataset.val_path))
-    predictions, metrics = run_visual_nemotron_mpdocvqa_on_dataset(
+    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_mpdocvqa_predictions.jsonl"
+    _predictions, metrics = run_visual_nemotron_mpdocvqa_on_dataset(
         cfg=cfg,
         dataset_path=dataset_path,
         topk=int(cfg.retrieval.topk),
         k_values=list(cfg.retrieval.k_values),
+        prediction_path=str(prediction_path),
     )
-    prediction_path = Path(cfg.paths.prediction_dir) / "visual_nemotron_mpdocvqa_predictions.jsonl"
     metrics_path = Path(cfg.paths.metric_dir) / "visual_nemotron_mpdocvqa_metrics.json"
-    save_jsonl(predictions, prediction_path)
     save_json(metrics, metrics_path)
     logger.info("Saved visual nemotron MP-DocVQA predictions to %s", prediction_path)
     logger.info("Saved visual nemotron MP-DocVQA metrics to %s", metrics_path)

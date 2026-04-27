@@ -40,6 +40,23 @@ ocr_reranker:
   max_length: 1024
   rerank_topk: 10
 
+ocr_jina_semantic_retrieval:
+  model_name: /home/cuizhibin/projects/Models/jina-embeddings-v5-text-small
+  local_files_only: true
+  device: cuda:0
+  batch_size: 8
+  max_length: 4096
+  semantic_topk: 30
+
+ocr_jina_reranker:
+  enable_jina_reranker: true
+  model_name: /home/cuizhibin/projects/Models/jina-reranker-v3
+  local_files_only: true
+  device: cuda:0
+  batch_size: 8
+  max_length: 2048
+  rerank_topk: 10
+
 visual_retriever:
   type: colpali_stub
   embedding_dim: 128
@@ -67,8 +84,19 @@ visual_nemotron_energy:
   local_files_only: true
   device: cuda:0
   batch_size: 2
+  query_encode_batch_size: 1
+  page_encode_batch_size: 2
   enable_embedding_cache: true
   enable_feature_cache: true
+  enable_embedding_cache_save: true
+  enable_feature_cache_save: false
+  enable_batch_cache_save: false
+  cache_chunk_size: 128
+  use_lazy_image_decode: true
+  max_candidates_for_fusion: 0
+  max_candidates_for_eval: 0
+  precompute_page_embeddings: false
+  run_post_train_eval: false
   cache_dir: outputs/cache/visual_nemotron_energy
   fusion_checkpoint_path: outputs/checkpoints/adaptive_fusion_visual_colqwen_ocr_chunk/adaptive_fusion_visual_colqwen_ocr_chunk_best.pkl
 
@@ -88,6 +116,99 @@ bm25_600_nemotron_bge_mpdocvqa:
   final_merge_strategy: rrf
   rrf_k: 60
   page_id_format: "{doc_id}_p{page_index}"
+
+bm25_600_nemotron_bge_selective_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  final_merge_strategy: rrf
+  rrf_k: 60
+  page_id_format: "{doc_id}_p{page_index}"
+  selective_confidence_threshold: 0.15
+
+bm25_600_nemotron_bge_topk_rerank_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  final_merge_strategy: rrf
+  rrf_k: 60
+  page_id_format: "{doc_id}_p{page_index}"
+  visual_topk_for_rerank: 20
+  rerank_alpha: 0.7
+  rerank_score_mode: ocr
+
+bm25_600_nemotron_jina_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  final_merge_strategy: rrf
+  rrf_k: 60
+  page_id_format: "{doc_id}_p{page_index}"
+
+ocr_jina_chunk_reranker:
+  enabled: true
+  chunk_size: 256
+  chunk_overlap: 64
+  chunk_topk_pages: 20
+  chunk_max_per_page: 10
+  max_chunks_per_query: 200
+
+bm25_600_nemotron_jina_chunk_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  final_merge_strategy: rrf
+  rrf_k: 60
+  page_id_format: "{doc_id}_p{page_index}"
+
+bm25_600_nemotron_bge_dynamic_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  stage_name: dynamic_rules
+  page_id_format: "{doc_id}_p{page_index}"
+
+bm25_600_queryaware_dynamic_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  stage_name: dynamic_rules
+  page_id_format: "{doc_id}_p{page_index}"
+#  route_conf_high: 0.15
+#  route_conf_low: 0.03
+  route_conf_high: 0.25
+  route_conf_low: 0.03
+
+bm25_600_queryaware_visual_dominant_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  stage_name: dynamic_rules
+  page_id_format: "{doc_id}_p{page_index}"
+  queryaware_conf_high: 0.25
+  queryaware_conf_low: 0.03
+#  queryaware_lambda_ocr_generic: 0.08
+#  queryaware_lambda_ocr_query: 0.15
+#  queryaware_lambda_visual_query: 0.03
+#  queryaware_lambda_ocr_generic: 0.04
+#  queryaware_lambda_ocr_query: 0.10
+#  queryaware_lambda_visual_query: 0.01
+  queryaware_lambda_ocr_generic: 0.03
+  queryaware_lambda_ocr_query: 0.08
+  queryaware_lambda_visual_query: 0.00
+
+bm25_600_selective_confidence_mpdocvqa:
+  dataset_path: data/processed/mpdocvqa/val.jsonl
+  coarse_topk: 600
+  stage_name: dynamic_rules
+  page_id_format: "{doc_id}_p{page_index}"
+#  selective_conf_high: 0.15
+#  selective_conf_low: 0.05
+#  selective_conf_high: 0.20
+#  selective_conf_low: 0.05
+#  queryaware_lambda_ocr_generic: 0.04
+#  queryaware_lambda_ocr_query: 0.10
+#  queryaware_lambda_visual_query: 0.01
+
+  selective_conf_high: 0.10
+  selective_conf_low: 0.02
+  queryaware_lambda_ocr_generic: 0.02
+  queryaware_lambda_ocr_query: 0.06
+  queryaware_lambda_visual_query: 0.00
+
 
 visual_nemotron_mpdocvqa:
   dataset_path: data/processed/mpdocvqa/val.jsonl

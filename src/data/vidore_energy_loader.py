@@ -102,7 +102,8 @@ def load_vidore_energy_dataset(dataset_path: str | Path, max_samples: int = 0) -
     )
     if samples:
         first = samples[0]
-        first_candidate = (first.get("candidates") or [{}])[0]
+        candidate_store = dict(first.get("candidate_store") or {})
+        first_candidate = candidate_store.get(int((first.get("candidate_page_ids") or [0])[0]), {})
         logger.info(
             "ViDoRe built sample summary: query_id=%s query=%r positive_corpus_ids=%s example_candidate_page_ids=%s",
             first.get("query_id"),
@@ -115,7 +116,7 @@ def load_vidore_energy_dataset(dataset_path: str | Path, max_samples: int = 0) -
             first_candidate.get("corpus_id", ""),
             first_candidate.get("page_id", ""),
             first_candidate.get("image_source_type", ""),
-            first_candidate.get("image") is not None,
+            first_candidate.get("image_bytes") is not None,
             first_candidate.get("image_path", ""),
         )
     return samples, summary
@@ -280,7 +281,12 @@ def _build_joined_samples(
     positives_by_query = _build_positive_qrels(qrels, corpus_id_to_page_id)
     samples: list[dict[str, Any]] = []
     sorted_candidates = sorted(candidates, key=lambda item: int(item["page_id"]))
+    candidate_store = {int(candidate["page_id"]): candidate for candidate in sorted_candidates}
+    candidate_page_ids = [int(candidate["page_id"]) for candidate in sorted_candidates]
     candidate_corpus_ids = [str(candidate["corpus_id"]) for candidate in sorted_candidates]
+    shared_page_id_to_corpus_id = {
+        str(candidate["page_id"]): str(candidate["corpus_id"]) for candidate in sorted_candidates
+    }
     for query_record in sorted(queries, key=lambda item: str(item.get("query_id", ""))):
         query_id = str(query_record.get("query_id", "")).strip()
         query = str(query_record.get("query", "")).strip()
@@ -305,11 +311,9 @@ def _build_joined_samples(
                 "gold_corpus_ids": positive_corpus_ids,
                 "positive_corpus_ids": positive_corpus_ids,
                 "candidate_corpus_ids": candidate_corpus_ids,
-                "candidate_page_records": sorted_candidates,
-                "candidates": sorted_candidates,
-                "page_id_to_corpus_id": {
-                    str(candidate["page_id"]): str(candidate["corpus_id"]) for candidate in sorted_candidates
-                },
+                "candidate_page_ids": candidate_page_ids,
+                "candidate_store": candidate_store,
+                "page_id_to_corpus_id": shared_page_id_to_corpus_id,
             }
         )
     avg_positives = (
@@ -319,9 +323,7 @@ def _build_joined_samples(
     )
     summary = {
         "num_candidate_pages": len(sorted_candidates),
-        "num_corpus_pages_with_images": sum(
-            1 for candidate in sorted_candidates if candidate.get("image") is not None or candidate.get("image_path")
-        ),
+        "num_corpus_pages_with_images": sum(1 for candidate in sorted_candidates if candidate.get("image_bytes") is not None or candidate.get("image_path")),
         "avg_positives_per_query": avg_positives,
         "avg_candidate_set_size": float(len(sorted_candidates)) if samples else 0.0,
         "image_field": image_field,
@@ -393,7 +395,7 @@ def _build_candidate_pool(
         return [], {}, {}, detected_image_field, detected_text_field, image_parse_summary, image_parse_diagnostics
     logger.info("ViDoRe corpus image parse summary: %s", image_parse_summary)
     logger.info("ViDoRe corpus image parse diagnostics: %s", image_parse_diagnostics)
-    if not any(candidate.get("image") is not None or candidate.get("image_path") for candidate in candidates):
+    if not any(candidate.get("image_bytes") is not None or candidate.get("image_path") for candidate in candidates):
         diagnostics = {
             "dataset_path": str(root),
             "image_parse_summary": image_parse_summary,
@@ -419,11 +421,11 @@ def _candidate_from_corpus_record(record: dict[str, Any], root: Path, page_id: i
     markdown, text_field = _first_value_with_key(record, PAGE_TEXT_KEYS)
     image_value = record.get("image")
     image_field = "corpus.image" if image_value is not None else ""
-    image_obj, image_path, source_type, image_meta = _resolve_hf_image_field(image_value, root)
-    if image_obj is None and image_path is None:
+    image_payload, image_path, source_type, image_meta = _resolve_hf_image_field(image_value, root)
+    if image_payload is None and image_path is None:
         path_value, path_key = _first_value_with_key(record, IMAGE_PATH_KEYS)
         if path_value is not None:
-            image_obj, image_path, source_type, direct_meta = _resolve_direct_image_path(str(path_value), root)
+            image_payload, image_path, source_type, direct_meta = _resolve_direct_image_path(str(path_value), root)
             image_meta = {**image_meta, "direct_path_meta": direct_meta}
             image_field = f"corpus.{path_key}"
     candidate: dict[str, Any] = {
@@ -434,8 +436,8 @@ def _candidate_from_corpus_record(record: dict[str, Any], root: Path, page_id: i
         "markdown": str(markdown or ""),
         "ocr_text": str(markdown or ""),
     }
-    if image_obj is not None:
-        candidate["image"] = image_obj
+    if isinstance(image_payload, (bytes, bytearray)):
+        candidate["image_bytes"] = bytes(image_payload)
     if image_path is not None:
         candidate["image_path"] = str(image_path)
     candidate["image_source_type"] = source_type
@@ -445,7 +447,7 @@ def _candidate_from_corpus_record(record: dict[str, Any], root: Path, page_id: i
 
 
 def _resolve_hf_image_field(value: Any, root: Path) -> tuple[Any | None, Path | None, str, dict[str, Any]]:
-    """Resolve a Hugging Face Image-style field into a PIL image or verified image path."""
+    """Resolve a Hugging Face Image-style field into bytes or verified image path."""
     meta: dict[str, Any] = {
         "image_field_exists": value is not None,
         "image_is_dict": isinstance(value, dict),
@@ -465,8 +467,12 @@ def _resolve_hf_image_field(value: Any, root: Path) -> tuple[Any | None, Path | 
         return None, None, "failed", meta
     if _is_pil_image(value):
         try:
+            import io as _io
+
+            buffer = _io.BytesIO()
+            value.convert("RGB").save(buffer, format="PNG")
             meta["pil_image_succeeded"] = True
-            return value.convert("RGB"), None, "pil", meta
+            return buffer.getvalue(), None, "pil", meta
         except Exception as exc:
             meta["path_load_error"] = f"PIL convert failed: {exc}"
             return None, None, "failed", meta
@@ -475,11 +481,8 @@ def _resolve_hf_image_field(value: Any, root: Path) -> tuple[Any | None, Path | 
             meta["image_has_bytes"] = True
             meta["image_bytes_non_empty"] = True
             try:
-                from PIL import Image
-
-                image = Image.open(io.BytesIO(value["bytes"])).convert("RGB")
                 meta["bytes_decode_succeeded"] = True
-                return image, None, "bytes", meta
+                return bytes(value["bytes"]), None, "bytes", meta
             except Exception as exc:
                 meta["bytes_decode_error"] = str(exc)
         elif "bytes" in value:

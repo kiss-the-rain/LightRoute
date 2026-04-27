@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from src.retrieval.adaptive_coarse_router import (
@@ -12,6 +13,9 @@ from src.retrieval.adaptive_coarse_router import (
 from src.retrieval.bm25_retriever import load_page_ocr_text
 from src.retrieval.ocr_bge_retriever import OCRBGERetriever, format_bge_query
 from src.retrieval.ocr_bge_reranker import OCRBGEReranker
+from src.utils.chunking import chunk_text
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_ocr_query_text(
@@ -250,6 +254,187 @@ def run_ocr_page_pipeline_for_subset(
     stats.update(semantic_stats)
     stats.update(rerank_stats)
     return reranked_result, stats
+
+
+def run_ocr_page_pipeline_for_subset_with_chunk_rerank(
+    cfg: Any,
+    sample: dict[str, Any],
+    candidate_page_ids: list[int],
+    topk: int,
+    retriever: OCRBGERetriever,
+    indexed_docs: set[str],
+    reranker: OCRBGEReranker | None = None,
+    page_text_cache: dict[str, list[str]] | None = None,
+    doc_id_override: str | None = None,
+    query_text: str | None = None,
+    query_variant: str = "raw_question",
+    semantic_topk: int | None = None,
+    rerank_topk: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run page retrieval first, then rerank bounded OCR chunks and aggregate back to pages."""
+    page_text_cache = page_text_cache or {}
+    effective_doc_id = str(doc_id_override or sample["doc_id"])
+    doc_key = f"ocr_page:{effective_doc_id}"
+    normalized_candidate_page_ids = [int(page_id) for page_id in candidate_page_ids]
+    semantic_result, semantic_stats = run_ocr_page_bge_m3(
+        cfg=cfg,
+        sample=sample,
+        retriever=retriever,
+        indexed_docs=indexed_docs,
+        candidate_page_ids=normalized_candidate_page_ids,
+        page_text_cache=page_text_cache,
+        query_text=query_text,
+        query_variant=query_variant,
+        doc_id_override=effective_doc_id,
+        semantic_topk=semantic_topk,
+    )
+    logger.info("[Pipeline] Using OCR CHUNK rerank branch")
+
+    chunk_cfg = getattr(cfg, "ocr_jina_chunk_reranker", None)
+    chunk_size = int(getattr(chunk_cfg, "chunk_size", 256) or 256)
+    chunk_overlap = int(getattr(chunk_cfg, "chunk_overlap", 64) or 64)
+    chunk_topk_pages = int(getattr(chunk_cfg, "chunk_topk_pages", 20) or 20)
+    chunk_max_per_page = int(getattr(chunk_cfg, "chunk_max_per_page", 10) or 10)
+    max_chunks_per_query = int(getattr(chunk_cfg, "max_chunks_per_query", chunk_topk_pages * chunk_max_per_page) or 0)
+    if max_chunks_per_query <= 0:
+        max_chunks_per_query = chunk_topk_pages * chunk_max_per_page
+
+    effective_rerank_topk = rerank_topk
+    if effective_rerank_topk is None:
+        effective_rerank_topk = int(getattr(getattr(cfg, "ocr_jina_reranker", None), "rerank_topk", 0) or topk)
+    if effective_rerank_topk <= 0:
+        effective_rerank_topk = len(semantic_result.get("page_ids", []))
+
+    stats = {
+        "ocr_rerank_calls": 0,
+        "ocr_num_pages_after_rerank": 0,
+        "ocr_chunk_rerank_enabled": True,
+        "ocr_chunk_topk_pages": int(chunk_topk_pages),
+        "ocr_chunk_max_per_page": int(chunk_max_per_page),
+        "ocr_chunk_total_chunks": 0,
+        "ocr_chunk_rerank_calls": 0,
+        "ocr_chunk_scores_changed": False,
+    }
+    stats.update(semantic_stats)
+    if not semantic_result.get("page_ids"):
+        logger.error("Chunk pipeline empty -> fallback detected: no semantic pages for doc_id=%s", effective_doc_id)
+        raise RuntimeError("Chunk pipeline failed: no semantic pages available for chunk rerank.")
+
+    page_ids = retriever.index[doc_key]["page_ids"]
+    retriever_page_texts = retriever.get_document_page_texts(doc_key)
+    sample_page_texts = [str(text or "") for text in sample.get("page_texts", [])]
+    page_id_to_text: dict[int, str] = {
+        int(page_id): str(text or "")
+        for page_id, text in enumerate(sample_page_texts)
+    }
+    for page_id, retriever_text in zip(page_ids, retriever_page_texts):
+        int_page_id = int(page_id)
+        sample_text = sample_page_texts[int_page_id] if 0 <= int_page_id < len(sample_page_texts) else ""
+        page_id_to_text[int_page_id] = str(sample_text or retriever_text or "")
+    semantic_scores = {
+        int(page_id): float(score)
+        for page_id, score in zip(semantic_result.get("page_ids", []), semantic_result.get("scores", []))
+    }
+    top_semantic_page_ids = [int(page_id) for page_id in semantic_result.get("page_ids", [])[:chunk_topk_pages]]
+
+    chunk_candidates: list[dict[str, Any]] = []
+    total_chunks = 0
+    for page_id in top_semantic_page_ids:
+        text = (
+            page_id_to_text.get(int(page_id), "")
+            or ""
+        )
+        if not str(text).strip():
+            continue
+        chunks = chunk_text(
+            text,
+            chunk_size=chunk_size,
+            overlap=chunk_overlap,
+        )[:chunk_max_per_page]
+        total_chunks += len(chunks)
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_candidates.append(
+                {
+                    "page_id": int(page_id),
+                    "chunk_index": int(chunk_index),
+                    "text": chunk,
+                    "score": float(semantic_scores.get(int(page_id), 0.0)),
+                }
+            )
+            if len(chunk_candidates) >= max_chunks_per_query:
+                break
+        if len(chunk_candidates) >= max_chunks_per_query:
+            break
+
+    if total_chunks == 0 or not chunk_candidates:
+        non_empty_page_text_count = sum(1 for text in page_id_to_text.values() if str(text).strip())
+        logger.error(
+            "Chunk pipeline empty -> fallback detected: doc_id=%s semantic_page_ids=%s len_page_texts=%d non_empty_page_text_count=%d",
+            effective_doc_id,
+            top_semantic_page_ids[:10],
+            len(page_id_to_text),
+            non_empty_page_text_count,
+        )
+        raise RuntimeError("Chunk pipeline failed: no chunks generated. Check OCR text field.")
+
+    if reranker is None:
+        logger.error("Chunk pipeline empty -> fallback detected: reranker is None")
+        raise RuntimeError("Chunk fallback not allowed: reranker is None.")
+
+    before_scores = [
+        float(semantic_scores.get(int(page_id), 0.0))
+        for page_id in semantic_result.get("page_ids", [])
+    ]
+
+    formatted_query = _resolve_ocr_query_text(sample, query_text=query_text, query_variant=query_variant)
+    logger.info("[Chunk Debug] total_chunks=%d", len(chunk_candidates))
+    chunk_reranked = reranker.rerank(formatted_query, chunk_candidates, topk=len(chunk_candidates))
+    logger.info("[Chunk Debug] rerank_calls=%d", len(chunk_candidates))
+    stats["ocr_rerank_calls"] = len(chunk_candidates)
+    stats["ocr_chunk_rerank_calls"] = 1
+    stats["ocr_chunk_total_chunks"] = int(total_chunks)
+
+    page_score_map: dict[int, float] = {}
+    for page_id, score in zip(chunk_reranked.get("page_ids", []), chunk_reranked.get("scores", [])):
+        int_page_id = int(page_id)
+        page_score_map[int_page_id] = max(float(score), page_score_map.get(int_page_id, float("-inf")))
+
+    candidate_page_ids_order = [int(page_id) for page_id in semantic_result.get("page_ids", [])]
+    scored_pages = [
+        (
+            page_id,
+            float(page_score_map.get(page_id, semantic_scores.get(page_id, 0.0))),
+            0 if page_id in page_score_map else 1,
+        )
+        for page_id in candidate_page_ids_order
+    ]
+    scored_pages.sort(key=lambda item: (item[2], -item[1]))
+    scored_pages = scored_pages[:effective_rerank_topk]
+    after_scores = [float(score) for _, score, _ in scored_pages]
+    if before_scores[: len(after_scores)] == after_scores:
+        logger.warning("Chunk rerank did not change scores for doc_id=%s", effective_doc_id)
+    else:
+        stats["ocr_chunk_scores_changed"] = True
+    final_result = {
+        "page_ids": [int(page_id) for page_id, _, _ in scored_pages],
+        "scores": [float(score) for _, score, _ in scored_pages],
+        "ranks": list(range(1, len(scored_pages) + 1)),
+        "ocr_bge_stage": {
+            "semantic_topk": int(semantic_topk or getattr(getattr(cfg, "ocr_jina_semantic_retrieval", None), "semantic_topk", 0) or 0),
+            "num_pages_after_bge": int(semantic_stats.get("ocr_num_pages_after_bge", 0)),
+        },
+        "ocr_reranker_stage": {
+            "rerank_topk": int(effective_rerank_topk or 0),
+            "num_pages_after_rerank": len(scored_pages),
+            "chunk_rerank": True,
+            "chunk_size": int(chunk_size),
+            "chunk_overlap": int(chunk_overlap),
+            "num_chunks": int(len(chunk_candidates)),
+        },
+        "routed_page_ids": list(normalized_candidate_page_ids),
+    }
+    stats["ocr_num_pages_after_rerank"] = len(final_result["page_ids"])
+    return final_result, stats
 
 
 def run_ocr_page_pipeline_for_sample(

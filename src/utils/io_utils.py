@@ -39,6 +39,15 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
+    """Yield JSONL records one by one."""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
 def save_jsonl(records: Iterable[dict[str, Any]], path: str | Path) -> None:
     """Save an iterable of dictionaries as JSONL."""
     target = Path(path)

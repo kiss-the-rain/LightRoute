@@ -14,6 +14,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.pipeline import (  # noqa: E402
     build_indexes_pipeline,
     eval_bm25_600_nemotron_bge_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_bge_selective_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_jina_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_jina_chunk_mpdocvqa_pipeline,
+    eval_bm25_600_nemotron_bge_dynamic_mpdocvqa_pipeline,
+    eval_bm25_600_queryaware_dynamic_mpdocvqa_pipeline,
+    eval_bm25_600_queryaware_visual_dominant_mpdocvqa_pipeline,
+    eval_bm25_600_selective_confidence_mpdocvqa_pipeline,
     eval_bm25_600_nemotron_bge_vidore_energy_pipeline,
     eval_bm25_vidore_energy_pipeline,
     eval_bm25_retrieval_pipeline,
@@ -156,6 +164,14 @@ def parse_args() -> argparse.Namespace:
             "eval_bm25_vidore_energy",
             "eval_bm25_600_nemotron_bge_vidore_energy",
             "eval_bm25_600_nemotron_bge_mpdocvqa",
+            "eval_bm25_600_nemotron_bge_selective_mpdocvqa",
+            "eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa",
+            "eval_bm25_600_nemotron_jina_mpdocvqa",
+            "eval_bm25_600_nemotron_jina_chunk_mpdocvqa",
+            "eval_bm25_600_nemotron_bge_dynamic_mpdocvqa",
+            "eval_bm25_600_queryaware_dynamic_mpdocvqa",
+            "eval_bm25_600_queryaware_visual_dominant_mpdocvqa",
+            "eval_bm25_600_selective_confidence_mpdocvqa",
             "eval_visual_val",
             "eval_visual_colqwen_val",
             "eval_visual_colqwen_adaptive_coarse_val",
@@ -259,6 +275,10 @@ def main() -> None:
             cfg.ocr_nv_retrieval.device = args.device
         if hasattr(cfg, "ocr_jina_retrieval"):
             cfg.ocr_jina_retrieval.device = args.device
+        if hasattr(cfg, "ocr_jina_semantic_retrieval"):
+            cfg.ocr_jina_semantic_retrieval.device = args.device
+        if hasattr(cfg, "ocr_jina_reranker"):
+            cfg.ocr_jina_reranker.device = args.device
         if hasattr(cfg, "visual_colqwen_retrieval"):
             cfg.visual_colqwen_retrieval.device = args.device
         if hasattr(cfg, "visual_nemotron_energy"):
@@ -275,6 +295,14 @@ def main() -> None:
         "eval_bm25_vidore_energy": eval_bm25_vidore_energy_pipeline,
         "eval_bm25_600_nemotron_bge_vidore_energy": eval_bm25_600_nemotron_bge_vidore_energy_pipeline,
         "eval_bm25_600_nemotron_bge_mpdocvqa": eval_bm25_600_nemotron_bge_mpdocvqa_pipeline,
+        "eval_bm25_600_nemotron_bge_selective_mpdocvqa": eval_bm25_600_nemotron_bge_selective_mpdocvqa_pipeline,
+        "eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa": eval_bm25_600_nemotron_bge_topk_rerank_mpdocvqa_pipeline,
+        "eval_bm25_600_nemotron_jina_mpdocvqa": eval_bm25_600_nemotron_jina_mpdocvqa_pipeline,
+        "eval_bm25_600_nemotron_jina_chunk_mpdocvqa": eval_bm25_600_nemotron_jina_chunk_mpdocvqa_pipeline,
+        "eval_bm25_600_nemotron_bge_dynamic_mpdocvqa": eval_bm25_600_nemotron_bge_dynamic_mpdocvqa_pipeline,
+        "eval_bm25_600_queryaware_dynamic_mpdocvqa": eval_bm25_600_queryaware_dynamic_mpdocvqa_pipeline,
+        "eval_bm25_600_queryaware_visual_dominant_mpdocvqa": eval_bm25_600_queryaware_visual_dominant_mpdocvqa_pipeline,
+        "eval_bm25_600_selective_confidence_mpdocvqa": eval_bm25_600_selective_confidence_mpdocvqa_pipeline,
         "eval_ocr_bge_val": eval_ocr_bge_retrieval_pipeline,
         "eval_ocr_bge_debug_val": eval_ocr_bge_debug_pipeline,
         "eval_ocr_bge_rerank_val": eval_ocr_bge_rerank_pipeline,

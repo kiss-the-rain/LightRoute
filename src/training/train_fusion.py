@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
 
 import numpy as np
 from tqdm import tqdm
 
 from src.data.vidore_energy_loader import load_vidore_energy_dataset
-from src.evaluation.retrieval_metrics import evaluate_retrieval
+from src.evaluation.retrieval_metrics import StreamingSetRetrievalMetrics, evaluate_retrieval
 from src.inference.infer_retrieval import (
     add_ocr_bm25_metric_aliases,
     _accumulate_adaptive_coarse_metrics,
@@ -70,7 +72,25 @@ from src.retrieval.dynamic_weighting import (
 )
 from src.training.trainer import Trainer
 from src.utils.io_utils import load_jsonl, load_pickle, save_json, save_jsonl, save_pickle
+from src.utils.jsonl_writer import JsonlStreamWriter
 from src.utils.logger import get_logger
+from src.utils.memory_utils import log_ram, release_memory
+
+
+def _cleanup_stale_visual_nemotron_tmp_dirs(cache_dir: Path, logger: Any) -> None:
+    """Remove leftover ephemeral batch shard directories from prior interrupted runs."""
+    if not cache_dir.exists():
+        return
+    cleaned = 0
+    for child in cache_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if "_tmp_" not in child.name:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        cleaned += 1
+    if cleaned > 0:
+        logger.info("Removed %d stale visual_nemotron temporary batch directories from %s", cleaned, cache_dir)
 
 
 def train_fusion(cfg: Any) -> dict[str, Any]:
@@ -853,8 +873,11 @@ def train_adaptive_fusion_visual_nemotron_ocr_energy(cfg: Any) -> dict[str, Any]
 
     samples, dataset_summary = load_vidore_energy_dataset(str(nemotron_cfg.dataset_path), max_samples=0)
     train_samples, val_samples, split_summary = _split_vidore_energy_samples(cfg, samples)
+    del samples
+    release_memory()
     logger.info("ViDoRe Energy dataset summary: %s", dataset_summary)
     logger.info("ViDoRe Energy train/val split summary: %s", split_summary)
+    log_ram(logger, "after_vidore_dataset_split")
     if not train_samples or not val_samples:
         metrics = {
             "status": "skipped",
@@ -865,95 +888,111 @@ def train_adaptive_fusion_visual_nemotron_ocr_energy(cfg: Any) -> dict[str, Any]
         save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json")
         return metrics
 
-    train_payload = _load_or_build_visual_nemotron_energy_batches(cfg, train_samples, split_name="train", logger=logger)
-    val_payload = _load_or_build_visual_nemotron_energy_batches(cfg, val_samples, split_name="val", logger=logger)
-    train_batches = train_payload["batches"]
-    val_batches = val_payload["batches"]
-    if not train_batches or not val_batches:
+    train_payload = None
+    val_payload = None
+    try:
+        train_payload = _load_or_build_visual_nemotron_energy_batches(cfg, train_samples, split_name="train", logger=logger)
+        val_payload = _load_or_build_visual_nemotron_energy_batches(cfg, val_samples, split_name="val", logger=logger)
+        if not train_payload["batch_paths"] or not val_payload["batch_paths"]:
+            metrics = {
+                "status": "skipped",
+                "reason": "visual_nemotron_ocr_energy batches are empty",
+                "dataset_summary": dataset_summary,
+                "split_summary": split_summary,
+                "train_batch_stats": train_payload["stats"],
+                "val_batch_stats": val_payload["stats"],
+            }
+            save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json")
+            return metrics
+
+        feature_dim = int(train_payload["feature_dim"])
+        model = AdaptiveFusionV2(
+            feature_dim=feature_dim,
+            hidden_dim=int(cfg.fusion.hidden_dim),
+            dropout=float(cfg.fusion.dropout),
+        )
+        checkpoint_dir = Path(cfg.paths.checkpoint_dir) / checkpoint_subdir
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        best_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_best.pkl"
+        last_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_last.pkl"
+        prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_predictions.jsonl"
+        metric_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_metrics.json"
+        train_metric_path = Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json"
+
+        best_mrr = float("-inf")
+        best_epoch = -1
+        best_val_metrics: dict[str, Any] = {}
+        history: list[dict[str, Any]] = []
+        patience = int(cfg.training.early_stopping_patience)
+        total_epochs = int(cfg.training.epochs)
+        epoch_iterator = tqdm(range(total_epochs), desc="visual_nemotron_ocr_energy epochs", unit="epoch")
+        for epoch in epoch_iterator:
+            log_ram(logger, f"before_train_epoch_{epoch + 1}")
+            train_metrics = _run_visual_nemotron_energy_train_epoch(cfg, model, train_payload)
+            log_ram(logger, f"after_train_epoch_{epoch + 1}")
+            val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_payload, prediction_path=str(prediction_path))
+            log_ram(logger, f"after_val_epoch_{epoch + 1}")
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                **train_metrics,
+                "val_mrr": float(val_metrics.get("MRR", 0.0)),
+                "val_recall@1": float(val_metrics.get("Recall@1", 0.0)),
+            }
+            history.append(epoch_metrics)
+            checkpoint = {
+                "epoch": epoch + 1,
+                "metric": float(val_metrics.get("MRR", 0.0)),
+                "metric_name": "val_mrr",
+                "branch_name": "adaptive_fusion_visual_nemotron_ocr_energy",
+                "model_state": model.state_dict(),
+            }
+            log_ram(logger, f"before_checkpoint_save_epoch_{epoch + 1}")
+            save_pickle(checkpoint, last_checkpoint_path)
+            if float(val_metrics.get("MRR", 0.0)) > best_mrr:
+                best_mrr = float(val_metrics.get("MRR", 0.0))
+                best_epoch = epoch + 1
+                best_val_metrics = dict(val_metrics)
+                save_pickle(checkpoint, best_checkpoint_path)
+                save_json(val_metrics, metric_path)
+            log_ram(logger, f"after_checkpoint_save_epoch_{epoch + 1}")
+            logger.info("Epoch %d visual_nemotron_ocr_energy metrics: %s", epoch + 1, epoch_metrics)
+            epoch_iterator.set_postfix(
+                train_loss=f"{float(train_metrics.get('train_loss', 0.0)):.4f}",
+                val_mrr=f"{float(val_metrics.get('MRR', 0.0)):.4f}",
+            )
+            if epoch + 1 - best_epoch >= patience:
+                logger.info("Early stopping triggered at epoch %d", epoch + 1)
+                break
+
+        best_checkpoint = load_pickle(best_checkpoint_path)
+        model.load_state_dict(best_checkpoint["model_state"])
+        run_post_train_eval = bool(getattr(nemotron_cfg, "run_post_train_eval", False))
+        if run_post_train_eval:
+            log_ram(logger, "before_post_train_val")
+            best_val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_payload, prediction_path=str(prediction_path))
+            save_json(best_val_metrics, metric_path)
+            log_ram(logger, "after_post_train_val")
         metrics = {
-            "status": "skipped",
-            "reason": "visual_nemotron_ocr_energy batches are empty",
+            "best_val_mrr": best_mrr,
+            "best_epoch": best_epoch,
+            "history": history,
+            "checkpoint_path": str(best_checkpoint_path),
             "dataset_summary": dataset_summary,
             "split_summary": split_summary,
             "train_batch_stats": train_payload["stats"],
             "val_batch_stats": val_payload["stats"],
+            "val_retrieval_metrics": best_val_metrics,
         }
-        save_json(metrics, Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json")
+        save_json(metrics, train_metric_path)
+        logger.info("Best checkpoint selected by val_mrr. checkpoint=%s", best_checkpoint_path)
+        logger.info("adaptive_fusion_visual_nemotron_ocr_energy training completed: %s", metrics)
         return metrics
-
-    feature_dim = len(train_batches[0]["candidate_rows"][0].get("feature_vector", []))
-    model = AdaptiveFusionV2(
-        feature_dim=feature_dim,
-        hidden_dim=int(cfg.fusion.hidden_dim),
-        dropout=float(cfg.fusion.dropout),
-    )
-    checkpoint_dir = Path(cfg.paths.checkpoint_dir) / checkpoint_subdir
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_best.pkl"
-    last_checkpoint_path = checkpoint_dir / f"{checkpoint_subdir}_last.pkl"
-    prediction_path = Path(cfg.paths.prediction_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_predictions.jsonl"
-    metric_path = Path(cfg.paths.metric_dir) / "adaptive_fusion_visual_nemotron_ocr_energy_val_metrics.json"
-    train_metric_path = Path(cfg.paths.metric_dir) / f"{cfg.experiment.name}_train_{checkpoint_subdir}_metrics.json"
-
-    best_mrr = float("-inf")
-    best_epoch = -1
-    history: list[dict[str, Any]] = []
-    patience = int(cfg.training.early_stopping_patience)
-    total_epochs = int(cfg.training.epochs)
-    epoch_iterator = tqdm(range(total_epochs), desc="visual_nemotron_ocr_energy epochs", unit="epoch")
-    for epoch in epoch_iterator:
-        train_metrics = _run_visual_nemotron_energy_train_epoch(cfg, model, train_batches)
-        val_predictions, val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_batches)
-        epoch_metrics = {
-            "epoch": epoch + 1,
-            **train_metrics,
-            "val_mrr": float(val_metrics.get("MRR", 0.0)),
-            "val_recall@1": float(val_metrics.get("Recall@1", 0.0)),
-        }
-        history.append(epoch_metrics)
-        checkpoint = {
-            "epoch": epoch + 1,
-            "metric": float(val_metrics.get("MRR", 0.0)),
-            "metric_name": "val_mrr",
-            "branch_name": "adaptive_fusion_visual_nemotron_ocr_energy",
-            "model_state": model.state_dict(),
-        }
-        save_pickle(checkpoint, last_checkpoint_path)
-        if float(val_metrics.get("MRR", 0.0)) > best_mrr:
-            best_mrr = float(val_metrics.get("MRR", 0.0))
-            best_epoch = epoch + 1
-            save_pickle(checkpoint, best_checkpoint_path)
-            save_jsonl(val_predictions, prediction_path)
-            save_json(val_metrics, metric_path)
-        logger.info("Epoch %d visual_nemotron_ocr_energy metrics: %s", epoch + 1, epoch_metrics)
-        epoch_iterator.set_postfix(
-            train_loss=f"{float(train_metrics.get('train_loss', 0.0)):.4f}",
-            val_mrr=f"{float(val_metrics.get('MRR', 0.0)):.4f}",
-        )
-        if epoch + 1 - best_epoch >= patience:
-            logger.info("Early stopping triggered at epoch %d", epoch + 1)
-            break
-
-    best_checkpoint = load_pickle(best_checkpoint_path)
-    model.load_state_dict(best_checkpoint["model_state"])
-    val_predictions, val_metrics = _eval_visual_nemotron_energy_batches(cfg, model, val_batches)
-    save_jsonl(val_predictions, prediction_path)
-    save_json(val_metrics, metric_path)
-    metrics = {
-        "best_val_mrr": best_mrr,
-        "best_epoch": best_epoch,
-        "history": history,
-        "checkpoint_path": str(best_checkpoint_path),
-        "dataset_summary": dataset_summary,
-        "split_summary": split_summary,
-        "train_batch_stats": train_payload["stats"],
-        "val_batch_stats": val_payload["stats"],
-        "val_retrieval_metrics": val_metrics,
-    }
-    save_json(metrics, train_metric_path)
-    logger.info("Best checkpoint selected by val_mrr. checkpoint=%s", best_checkpoint_path)
-    logger.info("adaptive_fusion_visual_nemotron_ocr_energy training completed: %s", metrics)
-    return metrics
+    finally:
+        if train_payload is not None:
+            _cleanup_visual_nemotron_batch_payload(train_payload)
+        if val_payload is not None:
+            _cleanup_visual_nemotron_batch_payload(val_payload)
+        release_memory(train_payload, val_payload)
 
 
 def _split_vidore_energy_samples(cfg: Any, samples: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -1007,45 +1046,66 @@ def _load_or_build_visual_nemotron_energy_batches(
     split_name: str,
     logger: Any,
 ) -> dict[str, Any]:
-    """Load or build branch-specific candidate feature batches for frozen Nemotron/OCR retrievers."""
+    """Load or build disk-backed branch-specific candidate feature batches."""
     nemotron_cfg = getattr(cfg, "visual_nemotron_energy", {})
     feature_cache_enabled = bool(getattr(nemotron_cfg, "enable_feature_cache", True))
+    feature_cache_save_enabled = bool(getattr(nemotron_cfg, "enable_feature_cache_save", False))
+    batch_cache_save_enabled = bool(getattr(nemotron_cfg, "enable_batch_cache_save", feature_cache_save_enabled))
     signature = _visual_nemotron_energy_config_signature(cfg, samples, split_name)
     cache_dir = Path(cfg.paths.cache_dir) / "fusion_visual_nemotron_ocr_energy"
-    cache_path = cache_dir / f"{split_name}_{signature}.pkl"
-    if feature_cache_enabled and cache_path.exists():
-        logger.info("Loaded visual_nemotron_ocr_energy %s batches from cache: %s", split_name, cache_path)
-        payload = load_pickle(cache_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_base_dir = cache_dir / f"{split_name}_{signature}"
+    manifest_path = cache_base_dir / "manifest.pkl"
+    if feature_cache_enabled and manifest_path.exists():
+        logger.info("Loaded visual_nemotron_ocr_energy %s batch manifest from cache: %s", split_name, manifest_path)
+        payload = load_pickle(manifest_path)
         payload["stats"]["feature_cache_hits"] = int(payload["stats"].get("feature_cache_hits", 0)) + 1
         return payload
     if not feature_cache_enabled:
-        logger.info("visual_nemotron_ocr_energy feature cache disabled; rebuilding %s batches.", split_name)
-
-    batches, stats = _build_visual_nemotron_energy_batches(cfg, samples, split_name=split_name, logger=logger)
-    payload = {
-        "batches": batches,
-        "stats": {
-            **stats,
+        logger.info("visual_nemotron_ocr_energy feature cache disabled; using ephemeral %s batch shards.", split_name)
+        _cleanup_stale_visual_nemotron_tmp_dirs(cache_dir, logger)
+        cache_base_dir = Path(
+            tempfile.mkdtemp(
+                dir=str(cache_dir),
+                prefix=f"{split_name}_{signature}_tmp_",
+            )
+        )
+    log_ram(logger, f"before_build_{split_name}_batch_shards")
+    payload = _build_visual_nemotron_energy_batch_shards(
+        cfg,
+        samples,
+        split_name=split_name,
+        logger=logger,
+        cache_base_dir=cache_base_dir,
+        persist_manifest=feature_cache_enabled and batch_cache_save_enabled,
+    )
+    payload["stats"].update(
+        {
             "feature_cache_hits": 0,
             "feature_cache_misses": 1,
-            "cache_path": str(cache_path) if feature_cache_enabled else "",
+            "cache_path": str(cache_base_dir),
             "config_signature": signature,
             "split_name": split_name,
             "feature_cache_enabled": feature_cache_enabled,
-        },
-    }
-    if feature_cache_enabled:
-        save_pickle(payload, cache_path)
+            "feature_cache_save_enabled": feature_cache_save_enabled,
+            "batch_cache_save_enabled": batch_cache_save_enabled,
+        }
+    )
+    if feature_cache_enabled and batch_cache_save_enabled:
+        save_pickle(payload, manifest_path)
+    log_ram(logger, f"after_build_{split_name}_batch_shards")
     return payload
 
 
-def _build_visual_nemotron_energy_batches(
+def _build_visual_nemotron_energy_batch_shards(
     cfg: Any,
     samples: list[dict[str, Any]],
     split_name: str,
     logger: Any,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Construct training/eval batches from frozen Nemotron visual and existing OCR route outputs."""
+    cache_base_dir: Path,
+    persist_manifest: bool,
+) -> dict[str, Any]:
+    """Construct disk-backed training/eval batches from frozen Nemotron visual and existing OCR route outputs."""
     nemotron_cfg = cfg.visual_nemotron_energy
     question_encoder = QuestionEncoder()
     ocr_quality_cache: dict[str, dict[int, dict[str, float]]] = {}
@@ -1054,8 +1114,13 @@ def _build_visual_nemotron_energy_batches(
         device=str(nemotron_cfg.device),
         local_files_only=bool(getattr(nemotron_cfg, "local_files_only", True)),
         cache_dir=str(getattr(nemotron_cfg, "cache_dir", "outputs/cache/visual_nemotron_energy")),
+        cache_namespace="vidore_energy",
         enable_cache=bool(getattr(nemotron_cfg, "enable_embedding_cache", True)),
         batch_size=int(getattr(nemotron_cfg, "batch_size", 4)),
+        query_batch_size=int(getattr(nemotron_cfg, "query_encode_batch_size", getattr(nemotron_cfg, "batch_size", 4))),
+        page_batch_size=int(getattr(nemotron_cfg, "page_encode_batch_size", getattr(nemotron_cfg, "batch_size", 4))),
+        enable_cache_save=bool(getattr(nemotron_cfg, "enable_embedding_cache_save", True)),
+        in_memory_cache_limit=int(getattr(nemotron_cfg, "cache_chunk_size", 128) or 128),
     )
     ocr_page_retriever = OCRBGERetriever(cfg, config_attr="ocr_semantic_retrieval")
     ocr_page_reranker = OCRBGEReranker(cfg, config_attr="ocr_reranker") if bool(getattr(cfg.ocr_reranker, "enable_bge_reranker", True)) else None
@@ -1064,7 +1129,10 @@ def _build_visual_nemotron_energy_batches(
     ocr_coarse_doc_retriever_cache: dict[str, Any] = {}
     ocr_coarse_stats = _build_adaptive_coarse_metric_accumulator(cfg, router_attr="ocr_router", stats_prefix="ocr_bm25")
     ocr_page_pipeline_stats = _build_ocr_page_pipeline_metric_accumulator()
-    batches: list[dict[str, Any]] = []
+    shutil.rmtree(cache_base_dir, ignore_errors=True)
+    batch_dir = cache_base_dir / "batches"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    batch_paths: list[str] = []
     stats: dict[str, Any] = {
         "num_samples": len(samples),
         "num_built_batches": 0,
@@ -1073,6 +1141,7 @@ def _build_visual_nemotron_energy_batches(
         "visual_embedding_cache_hits": 0,
         "visual_embedding_cache_misses": 0,
     }
+    feature_dim = 0
     logger.info("Building visual_nemotron_ocr_energy %s batches with frozen retrievers: %d samples", split_name, len(samples))
     for raw_sample in tqdm(samples, desc=f"NemotronFusionBatches {split_name}", unit="sample"):
         sample = _vidore_energy_sample_to_processed_sample(raw_sample)
@@ -1107,28 +1176,55 @@ def _build_visual_nemotron_energy_batches(
         if not any(label > 0.5 for label in labels):
             stats["skipped_missing_positive"] += 1
             continue
-        batches.append(
-            {
-                "qid": sample["qid"],
-                "doc_id": sample["doc_id"],
-                "question": sample.get("question", ""),
-                "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
-                "candidate_rows": candidate_rows,
-                "labels": labels,
-            }
-        )
+        batch = {
+            "qid": sample["qid"],
+            "doc_id": sample["doc_id"],
+            "question": sample.get("question", ""),
+            "evidence_pages": [int(page) for page in sample.get("evidence_pages", [])],
+            "candidate_rows": candidate_rows,
+            "labels": labels,
+        }
+        if feature_dim == 0 and batch["candidate_rows"]:
+            feature_dim = len(batch["candidate_rows"][0].get("feature_vector", []))
+        batch_path = batch_dir / f"batch_{len(batch_paths):06d}.pkl"
+        save_pickle(batch, batch_path)
+        batch_paths.append(str(batch_path))
+        release_memory(batch, candidate_rows, labels, sample, visual_result, ocr_result)
+        if len(batch_paths) % 64 == 0:
+            log_ram(logger, f"during_{split_name}_batch_shard_build_{len(batch_paths)}")
     visual_retriever.save_cache()
-    stats["num_built_batches"] = len(batches)
+    if not persist_manifest:
+        logger.info("visual_nemotron_ocr_energy %s batch shards built in ephemeral mode: %s", split_name, cache_base_dir)
+    stats["num_built_batches"] = len(batch_paths)
     stats.update(summarize_ocr_page_pipeline_metrics(ocr_page_pipeline_stats, len(samples)))
     stats.update(add_ocr_bm25_metric_aliases(summarize_adaptive_coarse_stats(ocr_coarse_stats, len(samples), stats_prefix="ocr_bm25")))
     stats.update(visual_retriever.cache_stats())
-    return batches, stats
+    return {
+        "batch_paths": batch_paths,
+        "feature_dim": int(feature_dim),
+        "cache_base_dir": str(cache_base_dir),
+        "persist_manifest": bool(persist_manifest),
+        "stats": stats,
+    }
+
+
+def _iter_visual_nemotron_energy_batches(payload: dict[str, Any]) -> Any:
+    for batch_path in payload.get("batch_paths", []):
+        yield load_pickle(batch_path)
+
+
+def _cleanup_visual_nemotron_batch_payload(payload: dict[str, Any]) -> None:
+    cache_base_dir = str(payload.get("cache_base_dir", "") or "")
+    persist_manifest = bool(payload.get("persist_manifest", False))
+    if not cache_base_dir or persist_manifest:
+        return
+    shutil.rmtree(cache_base_dir, ignore_errors=True)
 
 
 def _run_visual_nemotron_energy_train_epoch(
     cfg: Any,
     model: AdaptiveFusionV2,
-    train_batches: list[dict[str, Any]],
+    train_payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Train one epoch of the branch-specific fusion MLP."""
     learning_rate = float(cfg.training.learning_rate)
@@ -1136,16 +1232,20 @@ def _run_visual_nemotron_energy_train_epoch(
     total_loss = 0.0
     total_batches = 0
     total_candidates = 0
-    for batch in tqdm(train_batches, desc="visual_nemotron_ocr_energy train", unit="sample", leave=False):
+    positive_samples = 0
+    for batch in tqdm(_iter_visual_nemotron_energy_batches(train_payload), desc="visual_nemotron_ocr_energy train", unit="sample", leave=False):
         features = np.asarray([list(row["feature_vector"]) for row in batch["candidate_rows"]], dtype=float)
         labels = np.asarray(batch["labels"], dtype=float)
         loss = model.train_step(features, labels, learning_rate=learning_rate, weight_decay=weight_decay)
         total_loss += float(loss)
         total_batches += 1
         total_candidates += len(labels)
+        if any(label > 0.5 for label in batch.get("labels", [])):
+            positive_samples += 1
+        release_memory(features, labels, batch)
     return {
         "train_loss": total_loss / max(total_batches, 1),
-        "num_positive_samples": sum(1 for batch in train_batches if any(label > 0.5 for label in batch.get("labels", []))),
+        "num_positive_samples": positive_samples,
         "num_train_batches": total_batches,
         "avg_candidates_per_sample": float(total_candidates / max(total_batches, 1)),
     }
@@ -1154,28 +1254,33 @@ def _run_visual_nemotron_energy_train_epoch(
 def _eval_visual_nemotron_energy_batches(
     cfg: Any,
     model: AdaptiveFusionV2,
-    batches: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Evaluate branch-specific fusion MLP over cached candidate batches."""
-    predictions: list[dict[str, Any]] = []
-    for batch in tqdm(batches, desc="visual_nemotron_ocr_energy eval", unit="sample", leave=False):
+    payload: dict[str, Any],
+    prediction_path: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate branch-specific fusion MLP over disk-backed candidate batches."""
+    writer: JsonlStreamWriter | None = JsonlStreamWriter(prediction_path) if prediction_path else None
+    online_metrics = StreamingSetRetrievalMetrics(list(cfg.retrieval.k_values))
+    online_metrics.register_ndcg(10)
+    for batch in tqdm(_iter_visual_nemotron_energy_batches(payload), desc="visual_nemotron_ocr_energy eval", unit="sample", leave=False):
         ranked = model.rank_candidates(batch["candidate_rows"])
-        predictions.append(
-            {
-                "qid": batch["qid"],
-                "doc_id": batch["doc_id"],
-                "question": batch.get("question", ""),
-                "evidence_pages": [int(page) for page in batch.get("evidence_pages", [])],
-                "pred_page_ids": [int(page_id) for page_id in ranked["page_ids"][: int(cfg.retrieval.topk)]],
-                "pred_scores": [float(score) for score in ranked["scores"][: int(cfg.retrieval.topk)]],
-                "topk": int(cfg.retrieval.topk),
-            }
-        )
-    labeled_predictions = [item for item in predictions if item.get("evidence_pages")]
-    metrics = evaluate_retrieval(labeled_predictions, list(cfg.retrieval.k_values)) if labeled_predictions else {}
-    metrics["num_samples"] = len(predictions)
-    metrics["NDCG@10"] = _ndcg_at_k_for_predictions(labeled_predictions, k=10) if labeled_predictions else 0.0
-    return predictions, metrics
+        prediction = {
+            "qid": batch["qid"],
+            "doc_id": batch["doc_id"],
+            "question": batch.get("question", ""),
+            "evidence_pages": [int(page) for page in batch.get("evidence_pages", [])],
+            "pred_page_ids": [int(page_id) for page_id in ranked["page_ids"][: int(cfg.retrieval.topk)]],
+            "pred_scores": [float(score) for score in ranked["scores"][: int(cfg.retrieval.topk)]],
+            "topk": int(cfg.retrieval.topk),
+        }
+        online_metrics.update(prediction["pred_page_ids"], prediction["evidence_pages"])
+        if writer is not None:
+            writer.write(prediction)
+        release_memory(ranked, batch)
+    if writer is not None:
+        writer.close()
+    metrics = online_metrics.finalize()
+    metrics["NDCG@10"] = float(metrics.get("nDCG@10", 0.0))
+    return metrics
 
 
 def _ndcg_at_k_for_predictions(predictions: list[dict[str, Any]], k: int) -> float:

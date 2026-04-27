@@ -119,6 +119,8 @@ class BM25Retriever(TextRetriever):
     def _build_bm25(self, corpus: list[list[str]]):
         k1 = float(self.cfg.text_retriever.k1) if self.cfg is not None else 1.5
         b = float(self.cfg.text_retriever.b) if self.cfg is not None else 0.75
+        if not any(corpus):
+            return _SimpleBM25(corpus, k1=k1, b=b)
         if BM25Okapi is not None:
             return BM25Okapi(corpus, k1=k1, b=b)
         return _SimpleBM25(corpus, k1=k1, b=b)
