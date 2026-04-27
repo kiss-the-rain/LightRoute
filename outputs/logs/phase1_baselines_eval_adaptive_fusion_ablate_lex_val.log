@@ -1,0 +1,2 @@
+2026-03-29 20:48:39,705 | INFO | eval_adaptive_fusion_ablate_lex_val | Saved ablate_lex val predictions to outputs/predictions/adaptive_fusion_ablate_lex_val_predictions.jsonl
+2026-03-29 20:48:39,706 | INFO | eval_adaptive_fusion_ablate_lex_val | Saved ablate_lex val metrics to outputs/metrics/adaptive_fusion_ablate_lex_val_metrics.json

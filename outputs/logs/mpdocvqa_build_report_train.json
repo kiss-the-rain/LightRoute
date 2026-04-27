@@ -1,0 +1,11 @@
+{
+  "split": "train",
+  "raw_count": 36230,
+  "valid_count": 36230,
+  "skipped_missing_question": 0,
+  "skipped_missing_images": 0,
+  "skipped_missing_ocr": 0,
+  "skipped_mismatched_assets": 0,
+  "skipped_invalid_evidence_page": 0,
+  "skipped_missing_answer": 0
+}

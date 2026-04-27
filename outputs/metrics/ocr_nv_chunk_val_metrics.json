@@ -1,0 +1,19 @@
+{
+  "Recall@1": 0.42876421823790245,
+  "Hit@1": 0.42876421823790245,
+  "Recall@5": 0.736649315596684,
+  "Hit@5": 0.736649315596684,
+  "Recall@10": 0.8342008868324657,
+  "Hit@10": 0.8342008868324657,
+  "MRR": 0.5582325777814505,
+  "PageAcc": 0.42876421823790245,
+  "num_samples": 5187,
+  "num_unique_docs": 927,
+  "doc_ocr_nv_chunk_cache_hits": 4260,
+  "doc_ocr_nv_chunk_cache_misses": 927,
+  "chunk_size": 128,
+  "chunk_stride": 96,
+  "aggregation_strategy": "max",
+  "page_text_variant": "clean_page_text",
+  "coarse_topn": 30
+}

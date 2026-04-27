@@ -1,0 +1,3 @@
+2026-04-09 01:11:24,699 | INFO | eval_visual_colqwen_val | Saved visual ColQwen val predictions to outputs/predictions/visual_colqwen_val_predictions.jsonl
+2026-04-09 01:11:24,700 | INFO | eval_visual_colqwen_val | Saved visual ColQwen val metrics to outputs/metrics/visual_colqwen_val_metrics.json
+2026-04-09 01:11:24,700 | INFO | eval_visual_colqwen_val | Visual ColQwen val metrics: {'Recall@1': 0.6978985926354347, 'Hit@1': 0.6978985926354347, 'Recall@5': 0.8937728937728938, 'Hit@5': 0.8937728937728938, 'Recall@10': 0.9332947754000386, 'Hit@10': 0.9332947754000386, 'MRR': 0.7825204800768722, 'PageAcc': 0.6978985926354347, 'num_samples': 5187, 'num_unique_docs': 927, 'doc_visual_cache_hits': 4260, 'doc_visual_cache_misses': 927}

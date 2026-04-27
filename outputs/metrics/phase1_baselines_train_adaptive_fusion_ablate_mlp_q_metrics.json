@@ -1,0 +1,53 @@
+{
+  "best_val_accuracy": 0.942475203149054,
+  "best_epoch": 5,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.1720506562214077,
+      "train_accuracy": 0.9408811287165094,
+      "val_loss": 0.1678858409498777,
+      "val_accuracy": 0.9403511506908042
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.1590844348933074,
+      "train_accuracy": 0.9447457283503228,
+      "val_loss": 0.16476961513538035,
+      "val_accuracy": 0.9415008671590311
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.15665296156210673,
+      "train_accuracy": 0.945505977458614,
+      "val_loss": 0.1631747502508072,
+      "val_accuracy": 0.9419295749946411
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.15499735865796285,
+      "train_accuracy": 0.9463105744315554,
+      "val_loss": 0.1622055088998862,
+      "val_accuracy": 0.9422608492312489
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.1537947559903329,
+      "train_accuracy": 0.946690698985701,
+      "val_loss": 0.1616163496233227,
+      "val_accuracy": 0.942475203149054
+    }
+  ],
+  "checkpoint_path": "outputs/checkpoints/adaptive_fusion_ablate_mlp_q/adaptive_fusion_ablate_mlp_q_best.pkl",
+  "val_retrieval_metrics": {
+    "Recall@1": 0.6410256410256411,
+    "Hit@1": 0.6410256410256411,
+    "Recall@5": 0.8766146134567188,
+    "Hit@5": 0.8766146134567188,
+    "Recall@10": 0.919992288413341,
+    "Hit@10": 0.919992288413341,
+    "MRR": 0.7411030629075775,
+    "PageAcc": 0.6410256410256411,
+    "num_samples": 5187
+  }
+}

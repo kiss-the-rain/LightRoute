@@ -1,0 +1,4 @@
+2026-04-01 13:51:59,100 | INFO | eval_adaptive_fusion_mlp_ocrq_chunk_val | Saved adaptive_fusion_mlp_ocrq_chunk val predictions to outputs/predictions/adaptive_fusion_mlp_ocrq_chunk_val_predictions.jsonl
+2026-04-01 13:51:59,101 | INFO | eval_adaptive_fusion_mlp_ocrq_chunk_val | Saved adaptive_fusion_mlp_ocrq_chunk val metrics to outputs/metrics/adaptive_fusion_mlp_ocrq_chunk_val_metrics.json
+2026-04-02 20:23:48,136 | INFO | eval_adaptive_fusion_mlp_ocrq_chunk_val | Saved adaptive_fusion_mlp_ocrq_chunk val predictions to outputs/predictions/adaptive_fusion_mlp_ocrq_chunk_val_predictions.jsonl
+2026-04-02 20:23:48,136 | INFO | eval_adaptive_fusion_mlp_ocrq_chunk_val | Saved adaptive_fusion_mlp_ocrq_chunk val metrics to outputs/metrics/adaptive_fusion_mlp_ocrq_chunk_val_metrics.json

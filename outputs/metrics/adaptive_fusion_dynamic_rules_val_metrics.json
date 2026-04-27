@@ -1,0 +1,35 @@
+{
+  "Recall@1": 0.7234994913530011,
+  "Hit@1": 0.7234994913530011,
+  "Recall@5": 0.920854526958291,
+  "Hit@5": 0.920854526958291,
+  "Recall@10": 0.9582909460834181,
+  "Hit@10": 0.9582909460834181,
+  "MRR": 0.8092719888905051,
+  "PageAcc": 0.7234994913530011,
+  "num_samples": 4915,
+  "avg_visual_weight": 0.45813029674299843,
+  "avg_ocr_weight": 0.5418697032570015,
+  "weight_by_query_bucket": {
+    "generic_query": {
+      "avg_visual_weight": 0.4940400371927517,
+      "avg_ocr_weight": 0.5059599628072485
+    },
+    "visual_query": {
+      "avg_visual_weight": 0.5411509720226573,
+      "avg_ocr_weight": 0.45884902797734317
+    },
+    "ocr_query": {
+      "avg_visual_weight": 0.3133777522262603,
+      "avg_ocr_weight": 0.686622247773738
+    }
+  },
+  "weight_by_page_bucket": {
+    "mixed_page": {
+      "avg_visual_weight": 0.45813029674299843,
+      "avg_ocr_weight": 0.5418697032570015
+    }
+  },
+  "route_collapse_ratio": 0.0,
+  "rule_variant_name": "combined"
+}

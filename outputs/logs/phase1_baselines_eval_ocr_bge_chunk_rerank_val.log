@@ -1,0 +1,2 @@
+2026-04-01 03:26:23,357 | INFO | eval_ocr_bge_chunk_rerank_val | Saved OCR BGE chunk rerank val predictions to outputs/predictions/ocr_bge_chunk_rerank_val_predictions.jsonl
+2026-04-01 03:26:23,357 | INFO | eval_ocr_bge_chunk_rerank_val | Saved OCR BGE chunk rerank val metrics to outputs/metrics/ocr_bge_chunk_rerank_val_metrics.json

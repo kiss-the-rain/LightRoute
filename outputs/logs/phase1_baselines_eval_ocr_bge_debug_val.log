@@ -1,0 +1,3 @@
+2026-03-31 20:45:31,824 | INFO | eval_ocr_bge_debug_val | Saved OCR BGE debug summary to outputs/metrics/ocr_bge_debug_val_metrics.json
+2026-03-31 20:45:31,824 | INFO | eval_ocr_bge_debug_val | Saved OCR BGE debug runs to outputs/debug/ocr_bge_debug_runs.jsonl
+2026-03-31 20:45:31,825 | INFO | eval_ocr_bge_debug_val | Saved OCR BGE debug failure cases to outputs/debug/ocr_bge_failure_cases.jsonl

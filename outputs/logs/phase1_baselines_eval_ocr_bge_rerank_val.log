@@ -1,0 +1,2 @@
+2026-03-31 19:41:59,081 | INFO | eval_ocr_bge_rerank_val | Saved OCR BGE rerank val predictions to outputs/predictions/ocr_bge_rerank_val_predictions.jsonl
+2026-03-31 19:41:59,082 | INFO | eval_ocr_bge_rerank_val | Saved OCR BGE rerank val metrics to outputs/metrics/ocr_bge_rerank_val_metrics.json

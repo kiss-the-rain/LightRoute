@@ -1,0 +1,53 @@
+{
+  "best_val_accuracy": 0.9483272541867671,
+  "best_epoch": 5,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.16651457684676046,
+      "train_accuracy": 0.9415829205676601,
+      "val_loss": 0.14688402924336028,
+      "val_accuracy": 0.9474055771267208
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.14825777934418025,
+      "train_accuracy": 0.9484575765962658,
+      "val_loss": 0.14559159072428673,
+      "val_accuracy": 0.9473075263756521
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.14646193601532725,
+      "train_accuracy": 0.9494151293332442,
+      "val_loss": 0.1452720425215459,
+      "val_accuracy": 0.9477193395301408
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.14567862849683189,
+      "train_accuracy": 0.9497746092644023,
+      "val_loss": 0.14486105025382387,
+      "val_accuracy": 0.9479154410322783
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.1451228655785083,
+      "train_accuracy": 0.9500227458540511,
+      "val_loss": 0.14459180240718175,
+      "val_accuracy": 0.9483272541867671
+    }
+  ],
+  "checkpoint_path": "outputs/checkpoints/adaptive_fusion_visual_colqwen_ocr_chunk/adaptive_fusion_visual_colqwen_ocr_chunk_best.pkl",
+  "val_retrieval_metrics": {
+    "Recall@1": 0.6977058029689609,
+    "Hit@1": 0.6977058029689609,
+    "Recall@5": 0.8901098901098901,
+    "Hit@5": 0.8901098901098901,
+    "Recall@10": 0.9311740890688259,
+    "Hit@10": 0.9311740890688259,
+    "MRR": 0.7811124269770896,
+    "PageAcc": 0.6977058029689609,
+    "num_samples": 5187
+  }
+}

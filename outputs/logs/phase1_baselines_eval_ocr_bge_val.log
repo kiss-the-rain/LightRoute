@@ -1,0 +1,2 @@
+2026-03-31 18:37:37,545 | INFO | eval_ocr_bge_val | Saved OCR BGE val predictions to outputs/predictions/ocr_bge_val_predictions.jsonl
+2026-03-31 18:37:37,546 | INFO | eval_ocr_bge_val | Saved OCR BGE val metrics to outputs/metrics/ocr_bge_val_metrics.json

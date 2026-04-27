@@ -1,0 +1,16 @@
+{
+  "Recall@1": 0.39020628494312704,
+  "Hit@1": 0.39020628494312704,
+  "Recall@5": 0.6932716406400617,
+  "Hit@5": 0.6932716406400617,
+  "Recall@10": 0.8043184885290149,
+  "Hit@10": 0.8043184885290149,
+  "MRR": 0.5209325970604167,
+  "PageAcc": 0.39020628494312704,
+  "num_samples": 5187,
+  "num_unique_docs": 927,
+  "doc_text_cache_hits": 4260,
+  "doc_text_cache_misses": 927,
+  "doc_retriever_cache_hits": 4260,
+  "doc_retriever_cache_misses": 927
+}

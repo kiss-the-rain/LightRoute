@@ -1,0 +1,3 @@
+2026-03-25 12:04:04,494 | INFO | eval_rrf_val | Saved RRF val predictions to outputs/predictions/rrf_val_predictions.jsonl
+2026-03-25 12:04:04,494 | INFO | eval_rrf_val | Saved RRF val metrics to outputs/metrics/rrf_val_metrics.json
+2026-03-25 12:04:04,494 | INFO | eval_rrf_val | RRF val metrics: {'Recall@1': 0.5299787931366878, 'Hit@1': 0.5299787931366878, 'Recall@5': 0.8243686138422981, 'Hit@5': 0.8243686138422981, 'Recall@10': 0.9097744360902256, 'Hit@10': 0.9097744360902256, 'MRR': 0.6544129707663559, 'PageAcc': 0.5299787931366878, 'num_samples': 5187, 'num_unique_docs': 927, 'doc_text_cache_hits': 4260, 'doc_text_cache_misses': 927, 'doc_retriever_cache_hits': 4260, 'doc_retriever_cache_misses': 927, 'doc_visual_cache_hits': 4260, 'doc_visual_cache_misses': 927}

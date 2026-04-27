@@ -1,0 +1,19 @@
+{
+  "Recall@1": 0.6408328513591671,
+  "Hit@1": 0.6408328513591671,
+  "Recall@5": 0.8737227684596106,
+  "Hit@5": 0.8737227684596106,
+  "Recall@10": 0.915365336417968,
+  "Hit@10": 0.915365336417968,
+  "MRR": 0.7395508765809542,
+  "PageAcc": 0.6408328513591671,
+  "num_samples": 5187,
+  "num_unique_docs": 927,
+  "skipped_empty_candidates": 0,
+  "doc_text_cache_hits": 4260,
+  "doc_text_cache_misses": 927,
+  "doc_retriever_cache_hits": 4260,
+  "doc_retriever_cache_misses": 927,
+  "doc_visual_cache_hits": 4260,
+  "doc_visual_cache_misses": 927
+}

@@ -1,0 +1,12 @@
+{
+  "Recall@1": 0.0,
+  "Hit@1": 0.0,
+  "Recall@5": 0.0,
+  "Hit@5": 0.0,
+  "Recall@10": 0.0,
+  "Hit@10": 0.0,
+  "MRR": 0.0,
+  "PageAcc": 0.0,
+  "num_samples": 8,
+  "NDCG@10": 0.0
+}

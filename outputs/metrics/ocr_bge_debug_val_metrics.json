@@ -1,0 +1,48 @@
+{
+  "mode": "ocr_bge_debug",
+  "dataset_path": "data/processed/mpdocvqa/val.jsonl",
+  "num_runs": 4,
+  "best_run": {
+    "mode": "ocr_bge_debug",
+    "page_text_variant": "clean_page_text",
+    "query_variant": "instruction_query",
+    "coarse_topn": 50,
+    "num_samples": 5187,
+    "num_unique_docs": 927,
+    "Recall@1": 0.22267206477732793,
+    "Hit@1": 0.22267206477732793,
+    "Recall@5": 0.5213032581453634,
+    "Hit@5": 0.5213032581453634,
+    "Recall@10": 0.673992673992674,
+    "Hit@10": 0.673992673992674,
+    "MRR": 0.3504949033144507,
+    "PageAcc": 0.22267206477732793,
+    "coarse_recall@10": 0.673992673992674,
+    "coarse_recall@20": 0.7989203778677463,
+    "coarse_recall@30": 0.8467322151532678,
+    "coarse_recall@50": 0.8987854251012146,
+    "avg_token_count": 1869.3593138730064,
+    "max_token_count": 13972.0,
+    "truncated_ratio": 0.9276256394823954,
+    "num_docs": 927,
+    "num_pages": 19938
+  },
+  "selected_matrix": [
+    {
+      "page_text_variant": "raw_page_text",
+      "query_variant": "raw_question"
+    },
+    {
+      "page_text_variant": "clean_page_text",
+      "query_variant": "raw_question"
+    },
+    {
+      "page_text_variant": "clean_page_text",
+      "query_variant": "instruction_query"
+    },
+    {
+      "page_text_variant": "clean_trunc_page_text",
+      "query_variant": "instruction_query"
+    }
+  ]
+}

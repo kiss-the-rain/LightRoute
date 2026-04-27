@@ -1,0 +1,2 @@
+2026-03-31 14:53:20,365 | INFO | infer_adaptive_fusion_ablate_mlp_ocrq_test | Saved ablate_mlp_ocrq test predictions to outputs/predictions/adaptive_fusion_ablate_mlp_ocrq_test_predictions.jsonl
+2026-03-31 14:53:20,366 | INFO | infer_adaptive_fusion_ablate_mlp_ocrq_test | ablate_mlp_ocrq test metrics: {'num_samples': 5019, 'num_unique_docs': 959, 'skipped_empty_candidates': 0, 'doc_text_cache_hits': 4060, 'doc_text_cache_misses': 959, 'doc_retriever_cache_hits': 4060, 'doc_retriever_cache_misses': 959, 'doc_visual_cache_hits': 4060, 'doc_visual_cache_misses': 959}
